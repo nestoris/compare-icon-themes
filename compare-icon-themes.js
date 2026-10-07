@@ -232,6 +232,31 @@ class GraphicalComparisonWindow {
         this.app = app;
         this.iconName = iconName;
 
+        let entry = app.iconIndex.get(iconName);
+        this.occurrences = entry ? entry.occurrences : [];
+
+        // Список размеров — из прочитанных тем
+        let sizeSet = new Set();
+        for (let ti = 0; ti < app.themes.length; ti++) {
+            for (let [dirName, info] of app.themes[ti].directories) {
+                if (info.size != null) sizeSet.add(info.size);
+            }
+        }
+        this.availableSizes = Array.from(sizeSet).sort(function(a, b) { return a - b; });
+        if (this.availableSizes.length === 0) {
+            this.availableSizes = [16, 22, 24, 32, 48, 64];
+        }
+
+        // Начальный размер — ближайший к 48, но не больше 64
+        let def = this.availableSizes[0];
+        let best = -1;
+        for (let i = 0; i < this.availableSizes.length; i++) {
+            let s = this.availableSizes[i];
+            if (s <= 64 && s > best) { best = s; def = s; }
+        }
+        if (best < 0) def = this.availableSizes[0];
+        this.displaySize = def;
+
         this.window = new Gtk.Window({
             title: 'Visual comparison: ' + iconName,
             default_width: 900,
@@ -245,15 +270,12 @@ class GraphicalComparisonWindow {
         this.window.show_all();
     }
 
-    // Возвращает ключ строки для вхождения значка.
-    // Если size задан — числовая строка; иначе — тип (например, "Scalable").
     rowKeyOf(occ) {
         if (occ.size != null) return String(occ.size);
         if (occ.type) return occ.type;
         return '?';
     }
 
-    // Числовой ключ для сортировки строк.
     rowSortKeyOf(occ) {
         if (occ.size != null) return occ.size;
         return 999999;
@@ -266,136 +288,96 @@ class GraphicalComparisonWindow {
             margin: 8
         });
 
-        let entry = this.app.iconIndex.get(this.iconName);
-        let occurrences = entry ? entry.occurrences : [];
-
         // ---------- Шапка ----------
         let header = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 10 });
 
         let preview = new Gtk.Image();
         preview.set_size_request(64, 64);
         let pb = null;
-        for (let i = 0; i < occurrences.length; i++) {
-            if (!occurrences[i].isSymlink) {
-                pb = pixbufFromFile(occurrences[i].fullPath, 64);
+        for (let i = 0; i < this.occurrences.length; i++) {
+            if (!this.occurrences[i].isSymlink) {
+                pb = pixbufFromFile(this.occurrences[i].fullPath, 64);
                 if (pb) break;
             }
         }
         if (!pb) {
-            for (let i = 0; i < occurrences.length; i++) {
-                pb = pixbufFromFile(occurrences[i].fullPath, 64);
+            for (let i = 0; i < this.occurrences.length; i++) {
+                pb = pixbufFromFile(this.occurrences[i].fullPath, 64);
                 if (pb) break;
             }
         }
         preview.set_from_pixbuf(pb);
         header.pack_start(preview, false, false, 0);
 
-        let themesCount = this.app.themes.length;
+        let infoBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 3 });
+
         let hdrLabel = new Gtk.Label({
-            label: '<b>' + escapeMarkup(this.iconName) + '</b>\n' +
-                   'Rows = size, Columns = theme (' + themesCount + ')',
+            label: '<b>' + escapeMarkup(this.iconName) + '</b>',
             use_markup: true,
             halign: Gtk.Align.START
         });
-        header.pack_start(hdrLabel, false, false, 0);
+        infoBox.pack_start(hdrLabel, false, false, 0);
+
+        let subLabel = new Gtk.Label({
+            label: 'Rows = size, Columns = theme (' + this.app.themes.length + ')',
+            halign: Gtk.Align.START
+        });
+        infoBox.pack_start(subLabel, false, false, 0);
+
+        header.pack_start(infoBox, true, true, 0);
+
+        // ---------- Выбор размера отображения ----------
+        let sizeBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 5 });
+        sizeBox.pack_start(new Gtk.Label({ label: 'Display size:' }), false, false, 0);
+
+        this.sizeCombo = new Gtk.ComboBoxText();
+        for (let i = 0; i < this.availableSizes.length; i++) {
+            this.sizeCombo.append_text(this.availableSizes[i] + ' px');
+        }
+        let idx = this.availableSizes.indexOf(this.displaySize);
+        if (idx < 0) idx = 0;
+        this.sizeCombo.set_active(idx);
+        this.sizeCombo.connect('changed', () => {
+            let a = this.sizeCombo.get_active();
+            if (a < 0 || a >= this.availableSizes.length) return;
+            this.displaySize = this.availableSizes[a];
+            this.populateTable();
+        });
+        sizeBox.pack_start(this.sizeCombo, false, false, 0);
+
+        header.pack_start(sizeBox, false, false, 0);
+
         mainBox.pack_start(header, false, false, 0);
 
-        if (themesCount === 0 || occurrences.length === 0) {
-            let empty = new Gtk.Label({
-                label: '<i>No themes loaded, or icon not found in any theme.</i>',
-                use_markup: true,
-                halign: Gtk.Align.START
-            });
-            mainBox.pack_start(empty, false, false, 0);
-            this.window.add(mainBox);
-            return;
-        }
-
-        // ---------- Собираем строки (уникальные размеры) ----------
-        let rowMap = new Map();   // key -> sortKey
-        for (let i = 0; i < occurrences.length; i++) {
-            let key = this.rowKeyOf(occurrences[i]);
-            if (!rowMap.has(key)) rowMap.set(key, this.rowSortKeyOf(occurrences[i]));
-        }
-
-        let rows = Array.from(rowMap.keys());
-        rows.sort(function(a, b) {
-            let ka = rowMap.get(a);
-            let kb = rowMap.get(b);
-            if (ka !== kb) return ka - kb;
-            return a.localeCompare(b);
-        });
-
         // ---------- Модель ----------
-        // [0] size string
-        // [1] numeric sort key (int)
-        // затем для каждой темы: pixbuf, cell-background, type-string
+        this.store = new Gtk.ListStore();
         let colTypes = [GObject.TYPE_STRING, GObject.TYPE_INT];
-        for (let i = 0; i < themesCount; i++) {
+        for (let i = 0; i < this.app.themes.length; i++) {
             colTypes.push(GdkPixbuf.Pixbuf);
             colTypes.push(GObject.TYPE_STRING);
             colTypes.push(GObject.TYPE_STRING);
         }
-
-        this.store = new Gtk.ListStore();
         this.store.set_column_types(colTypes);
 
-        let self = this;
-        for (let ri = 0; ri < rows.length; ri++) {
-            let sz = rows[ri];
-            let rowData = [sz, rowMap.get(sz)];
-
-            for (let ti = 0; ti < this.app.themes.length; ti++) {
-                let theme = this.app.themes[ti];
-                let match = null;
-
-                for (let oi = 0; oi < occurrences.length; oi++) {
-                    let occ = occurrences[oi];
-                    if (occ.theme !== theme) continue;
-                    if (self.rowKeyOf(occ) !== sz) continue;
-                    match = occ;
-                    break;
-                }
-
-                if (match) {
-                    let pix = pixbufFromFile(match.fullPath, 48);
-                    let bg = match.isSymlink ? '#D9E6F2' : '#FFFFFF';
-                    rowData.push(pix);
-                    rowData.push(bg);
-                    rowData.push(match.isSymlink ? 'symlink' : 'file');
-                } else {
-                    rowData.push(null);
-                    rowData.push('#F0F0F0');
-                    rowData.push('');
-                }
-            }
-
-            let iter = this.store.append();
-            let idx = [];
-            for (let k = 0; k < rowData.length; k++) idx.push(k);
-            this.store.set(iter, idx, rowData);
-        }
-
-        // ---------- TreeView ----------
         this.view = new Gtk.TreeView({
             model: this.store,
             headers_clickable: true
         });
 
-        // Колонка "Size"
-let sizeR = new Gtk.CellRendererText();
-sizeR.set_property('xpad', 6);
-let sizeC = new Gtk.TreeViewColumn({ title: 'Size' });
-sizeC.pack_start(sizeR, true);       // было false — теперь тянется
-sizeC.add_attribute(sizeR, 'text', 0);
-sizeC.set_min_width(60);
-sizeC.set_resizable(true);
-sizeC.set_expand(true);              // ← ключевая строка: колонка забирает свободное место
-sizeC.set_sort_column_id(1);
-sizeC.set_clickable(true);
-this.view.append_column(sizeC);
+        // Колонка Size
+        let sizeR = new Gtk.CellRendererText();
+        sizeR.set_property('xpad', 6);
+        let sizeC = new Gtk.TreeViewColumn({ title: 'Size' });
+        sizeC.pack_start(sizeR, true);
+        sizeC.add_attribute(sizeR, 'text', 0);
+        sizeC.set_min_width(60);
+        sizeC.set_resizable(true);
+        sizeC.set_expand(true);
+        sizeC.set_sort_column_id(1);
+        sizeC.set_clickable(true);
+        this.view.append_column(sizeC);
 
-        // По колонке на каждую тему
+        // Колонки тем
         for (let ti = 0; ti < this.app.themes.length; ti++) {
             let pixIdx = 2 + ti * 3;
             let bgIdx  = 3 + ti * 3;
@@ -413,10 +395,9 @@ this.view.append_column(sizeC);
             c.add_attribute(r, 'cell-background', bgIdx);
             c.set_min_width(56);
             c.set_resizable(true);
+            c.set_expand(false);
             this.view.append_column(c);
         }
-
-        this.store.set_sort_column_id(1, Gtk.SortType.ASCENDING);
 
         let scroll = new Gtk.ScrolledWindow();
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC);
@@ -440,6 +421,96 @@ this.view.append_column(sizeC);
         mainBox.pack_start(btnBox, false, false, 0);
 
         this.window.add(mainBox);
+
+        this.populateTable();
+    }
+
+    // ==================== ЗАПОЛНЕНИЕ ТАБЛИЦЫ ====================
+    populateTable() {
+        this.store.clear();
+
+        if (this.app.themes.length === 0 || this.occurrences.length === 0) return;
+
+        // Уникальные размеры (строки)
+        let rowMap = new Map();
+        for (let i = 0; i < this.occurrences.length; i++) {
+            let key = this.rowKeyOf(this.occurrences[i]);
+            if (!rowMap.has(key)) rowMap.set(key, this.rowSortKeyOf(this.occurrences[i]));
+        }
+        let rows = Array.from(rowMap.keys());
+        rows.sort(function(a, b) {
+            let ka = rowMap.get(a);
+            let kb = rowMap.get(b);
+            if (ka !== kb) return ka - kb;
+            return a.localeCompare(b);
+        });
+
+        let self = this;
+        let displaySize = this.displaySize;
+
+        for (let ri = 0; ri < rows.length; ri++) {
+            let sz = rows[ri];
+            let rowData = [sz, rowMap.get(sz)];
+
+            for (let ti = 0; ti < this.app.themes.length; ti++) {
+                let theme = this.app.themes[ti];
+                let match = null;
+
+                for (let oi = 0; oi < this.occurrences.length; oi++) {
+                    let occ = this.occurrences[oi];
+                    if (occ.theme !== theme) continue;
+                    if (self.rowKeyOf(occ) !== sz) continue;
+                    match = occ;
+                    break;
+                }
+
+                if (match) {
+                    let pix = self.loadPixbufNearest(match.fullPath, displaySize);
+                    let bg = match.isSymlink ? '#D9E6F2' : '#FFFFFF';
+                    rowData.push(pix);
+                    rowData.push(bg);
+                    rowData.push(match.isSymlink ? 'symlink' : 'file');
+                } else {
+                    rowData.push(null);
+                    rowData.push('#F0F0F0');
+                    rowData.push('');
+                }
+            }
+
+            let iter = this.store.append();
+            let idx = [];
+            for (let k = 0; k < rowData.length; k++) idx.push(k);
+            this.store.set(iter, idx, rowData);
+        }
+
+        this.store.set_sort_column_id(1, Gtk.SortType.ASCENDING);
+    }
+
+    // ==================== ПИКСБУФ БЕЗ СГЛАЖИВАНИЯ ====================
+    loadPixbufNearest(absPath, size) {
+        try {
+            let raw = GdkPixbuf.Pixbuf.new_from_file(absPath);
+            let w = raw.get_width();
+            let h = raw.get_height();
+            if (w === size && h === size) return raw;
+
+            let scale = Math.min(size / w, size / h);
+            let newW = Math.max(1, Math.round(w * scale));
+            let newH = Math.max(1, Math.round(h * scale));
+            let scaled = raw.scale_simple(newW, newH, GdkPixbuf.InterpType.NEAREST);
+
+            if (newW === size && newH === size) return scaled;
+
+            let canvas = GdkPixbuf.Pixbuf.new(
+                GdkPixbuf.Colorspace.RGB, true, 8, size, size);
+            canvas.fill(0x00000000);
+            scaled.copy_area(0, 0, newW, newH, canvas,
+                Math.floor((size - newW) / 2),
+                Math.floor((size - newH) / 2));
+            return canvas;
+        } catch (e) {
+            return null;
+        }
     }
 }
 
