@@ -1,6 +1,6 @@
 # Icon theme comparer
 
-A tool for comparing Linux icon themes.
+## A tool for comparing Linux icon themes.
 
 Syntax:
 ```
@@ -13,6 +13,16 @@ Or:
 cjs compare-icon-themes.js
 ```
 
-Screenshot:
+*Screenshots:*
 
-![screenshot.png](screenshot.png)
+**Visual comparison**
+
+![visual-comparison](visual-comparison.png)
+
+**Browsing theme directories**
+
+![browse-theme](browse-theme.png)
+
+**System themes adding**
+
+![add-system-theme](add-system-theme.png)

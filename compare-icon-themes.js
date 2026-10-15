@@ -3,11 +3,6 @@
 // #!/usr/bin/cjs
 //
 // Icon Theme Comparer
-// Загружает несколько index.theme, показывает объединённый список имён значков
-// с фильтром (как в icon-theme-editor). По двойному клику — окно сравнения
-// одного имени во всех загруженных темах. Правая панель показывает, в каких
-// темах есть выделенный значок, в каких контекстах и какого размера, файл
-// это или симлинк и куда он указывает.
 
 imports.gi.versions.Gtk = '3.0';
 const Gtk = imports.gi.Gtk;
@@ -15,6 +10,11 @@ const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const GObject = imports.gi.GObject;
 const GdkPixbuf = imports.gi.GdkPixbuf;
+
+Gio._promisify(Gio.File.prototype, 'enumerate_children_async', 'enumerate_children_finish');
+Gio._promisify(Gio.FileEnumerator.prototype, 'next_files_async', 'next_files_finish');
+Gio._promisify(Gio.File.prototype, 'query_info_async', 'query_info_finish');
+Gio._promisify(Gio.File.prototype, 'load_contents_async', 'load_contents_finish');
 
 Gtk.init(null);
 
@@ -27,57 +27,69 @@ function decodeContents(contents) {
     if (typeof TextDecoder !== 'undefined') {
         try { return new TextDecoder('utf-8').decode(contents); } catch (e) {}
     }
-    try { return imports.byteArray.toString(contents); } catch (e) {}
     let s = '';
     for (let i = 0; i < contents.length; i++) s += String.fromCharCode(contents[i]);
     return s;
-}
-
-function readFile(path) {
-    try {
-        let file = Gio.File.new_for_path(path);
-        let [ok, contents] = file.load_contents(null);
-        if (!ok) return null;
-        return decodeContents(contents);
-    } catch (e) { return null; }
 }
 
 function escapeMarkup(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+let _transparentPixbuf = null;
+function getTransparentPixbuf() {
+    if (!_transparentPixbuf) {
+        _transparentPixbuf = GdkPixbuf.Pixbuf.new(
+            GdkPixbuf.Colorspace.RGB, true, 8, 1, 1);
+        _transparentPixbuf.fill(0x00000000);
+    }
+    return _transparentPixbuf;
+}
+
+const pixbufCache = new Map();
+
 function pixbufFromFile(path, size) {
+    const cacheKey = path + '::' + size;
+    if (pixbufCache.has(cacheKey)) return pixbufCache.get(cacheKey);
+
+    let result = null;
     try {
-        // 1. Читаем как есть, без интерполяции
         let raw = GdkPixbuf.Pixbuf.new_from_file(path);
         let w = raw.get_width();
         let h = raw.get_height();
 
-        if (w === size && h === size) return raw;
+        if (w === size && h === size) {
+            result = raw;
+        } else {
+            // Сохраняем пропорции, масштабируем NEAREST (без сглаживания)
+            const scale = Math.min(size / w, size / h);
+            const newW = Math.max(1, Math.round(w * scale));
+            const newH = Math.max(1, Math.round(h * scale));
+            const scaled = (newW === w && newH === h)
+                ? raw
+                : raw.scale_simple(newW, newH, GdkPixbuf.InterpType.NEAREST);
 
-        // 2. Масштабируем NEAREST с сохранением пропорций
-        let scale = Math.min(size / w, size / h);
-        let newW = Math.max(1, Math.round(w * scale));
-        let newH = Math.max(1, Math.round(h * scale));
-        let scaled = raw.scale_simple(newW, newH, GdkPixbuf.InterpType.NEAREST);
-
-        if (newW === size && newH === size) return scaled;
-
-        // 3. Центрируем на прозрачном полотне
-        let canvas = GdkPixbuf.Pixbuf.new(
-            GdkPixbuf.Colorspace.RGB, true, 8, size, size);
-        canvas.fill(0x00000000);
-        scaled.copy_area(0, 0, newW, newH, canvas,
-            Math.floor((size - newW) / 2),
-            Math.floor((size - newH) / 2));
-        return canvas;
+            if (newW === size && newH === size) {
+                result = scaled;
+            } else {
+                const canvas = GdkPixbuf.Pixbuf.new(
+                    GdkPixbuf.Colorspace.RGB, true, 8, size, size);
+                canvas.fill(0x00000000);
+                scaled.copy_area(0, 0, newW, newH, canvas,
+                    Math.floor((size - newW) / 2),
+                    Math.floor((size - newH) / 2));
+                result = canvas;
+            }
+        }
     } catch (e) {
-        return null;
+        result = null;
     }
+
+    pixbufCache.set(cacheKey, result);
+    return result;
 }
 
 function resolveTargetPath(themeDir, dirName, target) {
-    // Резолвим относительный путь симлинка.
     try {
         let base = GLib.build_filenamev([themeDir, dirName]);
         return GLib.canonicalize_filename(target, base);
@@ -85,7 +97,7 @@ function resolveTargetPath(themeDir, dirName, target) {
 }
 
 // =====================================================================
-// КЛАСС ICONTHEME — распарсенная тема
+// КЛАСС ICONTHEME
 // =====================================================================
 
 class IconTheme {
@@ -94,21 +106,45 @@ class IconTheme {
         this.dir = GLib.path_get_dirname(indexPath);
         this.name = GLib.path_get_basename(this.dir);
         this.comment = '';
-        this.directoryList = [];      // ["16", "22", "devices/48", ...]
-        this.directories = new Map(); // dirName -> {context, size, type, scale}
-        this.icons = new Map();       // baseName -> {occurrences: [{...}]}
+        this.example = '';
+        this.directoryList = [];
+        this.directories = new Map();
+        this.icons = new Map();
         this.error = null;
+        this._loaded = false;
     }
 
-    load() {
+    async load() {
+        if (this._loaded) return true;
         try {
-            let content = readFile(this.indexPath);
-            if (!content) {
-                this.error = 'Cannot read ' + this.indexPath;
-                return false;
+            const keyFile = new GLib.KeyFile();
+            keyFile.load_from_file(this.indexPath, GLib.KeyFileFlags.NONE);
+
+            try { this.name = keyFile.get_string('Icon Theme', 'Name') || this.name; } catch (e) {}
+            try { this.comment = keyFile.get_string('Icon Theme', 'Comment') || ''; } catch (e) {}
+            try { this.example = keyFile.get_string('Icon Theme', 'Example') || ''; } catch (e) {}
+
+            let dirsStr = '';
+            try { dirsStr = keyFile.get_string('Icon Theme', 'Directories') || ''; } catch (e) {}
+            this.directoryList = dirsStr.split(',').map(s => s.trim()).filter(Boolean);
+
+            for (const dirName of this.directoryList) {
+                const info = { context: '', size: null, type: '', scale: null };
+                try { info.context = keyFile.get_string(dirName, 'Context') || ''; } catch (e) {}
+                try {
+                    const sz = keyFile.get_integer(dirName, 'Size');
+                    if (sz > 0) info.size = sz;
+                } catch (e) {}
+                try { info.type = keyFile.get_string(dirName, 'Type') || ''; } catch (e) {}
+                try {
+                    const sc = keyFile.get_integer(dirName, 'Scale');
+                    if (sc > 0) info.scale = sc;
+                } catch (e) {}
+                this.directories.set(dirName, info);
             }
-            this.parseIndex(content);
-            this.scanIcons();
+
+            await this.scanIconsAsync();
+            this._loaded = true;
             return true;
         } catch (e) {
             this.error = e.message || String(e);
@@ -116,146 +152,387 @@ class IconTheme {
         }
     }
 
-    parseIndex(content) {
-        let lines = content.split(/\r?\n/);
-        let currentSection = null;
-        let inIconTheme = false;
-        let dirs = [];
+    async scanIconsAsync() {
+        const validExts = ['.png', '.svg', '.xpm'];
+        const self = this;
 
-        for (let i = 0; i < lines.length; i++) {
-            let line = lines[i].trim();
-            if (!line || line.charAt(0) === '#') continue;
-
-            if (line.charAt(0) === '[' && line.charAt(line.length - 1) === ']') {
-                currentSection = line.substring(1, line.length - 1);
-                inIconTheme = (currentSection === 'Icon Theme');
-                if (!inIconTheme) {
-                    this.directories.set(currentSection, {
-                        context: '', size: null, type: '', scale: null
-                    });
-                }
-                continue;
-            }
-
-            let eq = line.indexOf('=');
-            if (eq < 0) continue;
-            let key = line.substring(0, eq).trim();
-            let value = line.substring(eq + 1).trim();
-
-            if (inIconTheme) {
-                if (key === 'Name') this.name = value;
-                else if (key === 'Comment') this.comment = value;
-                else if (key === 'Directories') {
-                    dirs = value.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
-                }
-            } else if (currentSection) {
-                let d = this.directories.get(currentSection);
-                if (!d) continue;
-                if (key === 'Context') d.context = value;
-                else if (key === 'Size') d.size = parseInt(value) || null;
-                else if (key === 'Type') d.type = value;
-                else if (key === 'Scale') d.scale = parseInt(value) || null;
-            }
-        }
-
-        this.directoryList = dirs;
-    }
-
-    scanIcons() {
-        let validExts = ['.png', '.svg', '.xpm'];
-        let self = this;
-
-        for (let k = 0; k < this.directoryList.length; k++) {
-            let dirName = this.directoryList[k];
-            let dirInfo = this.directories.get(dirName);
+        // Обрабатываем каталоги последовательно, а не через Promise.all.
+        // Каждый вызов enumerate_children_async держит открытый дескриптор,
+        // пока мы его не закроем. Параллельный обход десятков каталогов
+        // мгновенно упирается в системный лимит EMFILE ("Too many open files").
+        for (const dirName of this.directoryList) {
+            const dirInfo = this.directories.get(dirName);
             if (!dirInfo) continue;
 
-            let absDir = GLib.build_filenamev([this.dir, dirName]);
-            let dir = Gio.File.new_for_path(absDir);
-            if (!dir.query_exists(null)) continue;
+            const absDir = GLib.build_filenamev([this.dir, dirName]);
+            const dir = Gio.File.new_for_path(absDir);
 
+            let enumerator = null;
+            try {
+                enumerator = await dir.enumerate_children_async(
+                    'standard::name,standard::type,standard::is-symlink,standard::symlink-target',
+                    Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                    GLib.PRIORITY_DEFAULT,
+                    null);
+
+                let fileInfos;
+                do {
+                    try {
+                        // Батч побольше — меньше итераций и дескрипторов
+                        // на каждый следующий вызов.
+                        fileInfos = await enumerator.next_files_async(
+                            200, GLib.PRIORITY_DEFAULT, null);
+                    } catch (e) {
+                        break;
+                    }
+
+                    for (const info of fileInfos) {
+                        const name = info.get_name();
+                        const dot = name.lastIndexOf('.');
+                        if (dot < 0) continue;
+                        const ext = name.substring(dot).toLowerCase();
+                        if (!validExts.includes(ext)) continue;
+
+                        const baseName = name.substring(0, dot);
+                        const isSymlink = info.get_is_symlink();
+                        let target = null;
+                        if (isSymlink) {
+                            try { target = info.get_symlink_target(); } catch (e) {}
+                        }
+
+                        if (!self.icons.has(baseName)) {
+                            self.icons.set(baseName, { occurrences: [] });
+                        }
+
+                        self.icons.get(baseName).occurrences.push({
+                            theme: self,
+                            dirName: dirName,
+                            fileName: name,
+                            fullPath: absDir + '/' + name,
+                            relPath: dirName + '/' + name,
+                            size: dirInfo.size,
+                            context: dirInfo.context,
+                            type: dirInfo.type,
+                            isSymlink: isSymlink,
+                            target: target,
+                            resolvedTarget: isSymlink
+                                ? resolveTargetPath(self.dir, dirName, target)
+                                : null
+                        });
+                    }
+                } while (fileInfos.length > 0);
+            } catch (e) {
+                // Проблема в одном подкаталоге не должна ронять всю тему.
+            } finally {
+                if (enumerator) {
+                    try { enumerator.close(null); } catch (e) {}
+                }
+            }
+        }
+    }
+}
+
+// =====================================================================
+// ДИАЛОГ ВЫБОРА СИСТЕМНЫХ ТЕМ
+// =====================================================================
+
+class SystemThemesDialog {
+    constructor(parent, app) {
+        this.app = app;
+        this.dialog = new Gtk.Dialog({
+            title: 'Add system icon themes',
+            transient_for: parent,
+            modal: true,
+            default_width: 820,
+            default_height: 520
+        });
+        this.dialog.add_button('Cancel', Gtk.ResponseType.CANCEL);
+        this.dialog.add_button('Add selected', Gtk.ResponseType.OK);
+
+        this.buildUI();
+    }
+
+    buildUI() {
+        const content = this.dialog.get_content_area();
+        content.set_spacing(6);
+        content.set_margin_start(10);
+        content.set_margin_end(10);
+        content.set_margin_top(10);
+        content.set_margin_bottom(10);
+
+        const label = new Gtk.Label({
+            label: 'Select one or more system themes to add:',
+            halign: Gtk.Align.START
+        });
+        content.pack_start(label, false, false, 0);
+
+        this.store = new Gtk.ListStore();
+        this.store.set_column_types([
+            GdkPixbuf.Pixbuf,    // 0 preview
+            GObject.TYPE_STRING, // 1 name
+            GObject.TYPE_STRING, // 2 path
+            GObject.TYPE_STRING  // 3 example
+        ]);
+
+        this.view = new Gtk.TreeView({ model: this.store });
+        this.view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE);
+
+        const pixRenderer = new Gtk.CellRendererPixbuf();
+        pixRenderer.set_property('xpad', 4);
+        pixRenderer.set_property('ypad', 2);
+        const pixCol = new Gtk.TreeViewColumn({ title: 'Preview' });
+        pixCol.pack_start(pixRenderer, false);
+        pixCol.add_attribute(pixRenderer, 'pixbuf', 0);
+        pixCol.set_min_width(56);
+        pixCol.set_resizable(true);
+        this.view.append_column(pixCol);
+
+        const nameRenderer = new Gtk.CellRendererText();
+        nameRenderer.set_property('ellipsize', 3);
+        const nameCol = new Gtk.TreeViewColumn({ title: 'Name' });
+        nameCol.pack_start(nameRenderer, true);
+        nameCol.add_attribute(nameRenderer, 'text', 1);
+        nameCol.set_min_width(160);
+        nameCol.set_resizable(true);
+        nameCol.set_sort_column_id(1);
+        nameCol.set_clickable(true);
+        nameCol.set_expand(true);
+        this.view.append_column(nameCol);
+
+        const pathRenderer = new Gtk.CellRendererText();
+        pathRenderer.set_property('ellipsize', 3);
+        const pathCol = new Gtk.TreeViewColumn({ title: 'Path' });
+        pathCol.pack_start(pathRenderer, true);
+        pathCol.add_attribute(pathRenderer, 'text', 2);
+        pathCol.set_min_width(300);
+        pathCol.set_resizable(true);
+        pathCol.set_sort_column_id(2);
+        pathCol.set_clickable(true);
+        pathCol.set_expand(true);
+        this.view.append_column(pathCol);
+
+        this.store.set_sort_column_id(1, Gtk.SortType.ASCENDING);
+
+        const scroll = new Gtk.ScrolledWindow();
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC);
+        scroll.add(this.view);
+        content.pack_start(scroll, true, true, 0);
+
+        this.dialog.show_all();
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this.scanSystemThemes();
+            return false;
+        });
+    }
+
+    scanSystemThemes() {
+        const searchDirs = [];
+        const home = GLib.get_home_dir();
+        searchDirs.push(GLib.build_filenamev([home, '.icons']));
+        searchDirs.push(GLib.build_filenamev([GLib.get_user_data_dir(), 'icons']));
+        for (const d of GLib.get_system_data_dirs()) {
+            searchDirs.push(GLib.build_filenamev([d, 'icons']));
+        }
+        searchDirs.push('/usr/share/pixmaps');
+
+        const seen = new Set();
+        const themes = [];
+
+        for (const baseDir of searchDirs) {
+            const dir = Gio.File.new_for_path(baseDir);
             let enumerator;
             try {
                 enumerator = dir.enumerate_children(
-                    'standard::name,standard::type,standard::is-symlink,standard::symlink-target',
-                    Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+                    'standard::name,standard::type',
+                    Gio.FileQueryInfoFlags.NONE, null);
             } catch (e) {
                 continue;
             }
 
             let info;
             while ((info = enumerator.next_file(null)) !== null) {
-                let name = info.get_name();
-                let dot = name.lastIndexOf('.');
-                if (dot < 0) continue;
-                let ext = name.substring(dot).toLowerCase();
-                if (validExts.indexOf(ext) < 0) continue;
+                if (info.get_file_type() !== Gio.FileType.DIRECTORY) continue;
 
-                let baseName = name.substring(0, dot);
-                let isSymlink = info.get_is_symlink();
-                let target = null;
-                if (isSymlink) {
-                    try { target = info.get_symlink_target(); } catch (e) {}
+                const themeName = info.get_name();
+                const themeDir = GLib.build_filenamev([baseDir, themeName]);
+                const indexPath = GLib.build_filenamev([themeDir, 'index.theme']);
+
+                if (seen.has(indexPath)) continue;
+                seen.add(indexPath);
+
+                const indexFile = Gio.File.new_for_path(indexPath);
+                if (!indexFile.query_exists(null)) continue;
+
+                try {
+                    const kf = new GLib.KeyFile();
+                    kf.load_from_file(indexPath, GLib.KeyFileFlags.NONE);
+
+                    // --- Фильтр тем курсоров ---
+                    // У настоящих иконочных тем в index.theme всегда есть
+                    // непустой ключ Directories. У тем курсоров его нет.
+                    // Если и он отсутствует — пропускаем тему.
+                    let dirsStr = '';
+                    try {
+                        dirsStr = kf.get_string('Icon Theme', 'Directories') || '';
+                    } catch (e) {}
+                    if (!dirsStr.trim()) continue;
+
+                    // Дополнительно: если в каталоге темы есть только
+                    // подкаталог cursors (а иконочных директорий нет) —
+                    // тоже пропускаем.
+                    const cursorsDir = GLib.build_filenamev([themeDir, 'cursors']);
+                    if (GLib.file_test(cursorsDir, GLib.FileTest.IS_DIR)) {
+                        const listed = dirsStr.split(',').map(s => s.trim()).filter(Boolean);
+                        // Проверяем, есть ли хоть одна реально
+                        // существующая директория с иконками.
+                        let hasRealDir = false;
+                        for (const d of listed) {
+                            const sub = GLib.build_filenamev([themeDir, d]);
+                            if (GLib.file_test(sub, GLib.FileTest.IS_DIR)) {
+                                hasRealDir = true;
+                                break;
+                            }
+                        }
+                        if (!hasRealDir) continue;
+                    }
+
+                    let displayName = themeName;
+                    try {
+                        displayName = kf.get_string('Icon Theme', 'Name') || themeName;
+                    } catch (e) {}
+                    let example = '';
+                    try {
+                        example = kf.get_string('Icon Theme', 'Example') || '';
+                    } catch (e) {}
+
+                    themes.push({
+                        name: displayName,
+                        dirName: themeName,
+                        dir: themeDir,
+                        indexPath: indexPath,
+                        example: example
+                    });
+                } catch (e) {
+                    // пропускаем нечитаемые index.theme
                 }
-
-                if (!self.icons.has(baseName)) {
-                    self.icons.set(baseName, { occurrences: [] });
-                }
-
-                self.icons.get(baseName).occurrences.push({
-                    theme: self,
-                    dirName: dirName,
-                    fileName: name,
-                    fullPath: absDir + '/' + name,
-                    relPath: dirName + '/' + name,
-                    size: dirInfo.size,
-                    context: dirInfo.context,
-                    type: dirInfo.type,
-                    isSymlink: isSymlink,
-                    target: target,
-                    resolvedTarget: isSymlink
-                        ? resolveTargetPath(self.dir, dirName, target)
-                        : null
-                });
             }
             enumerator.close(null);
         }
+
+        themes.sort((a, b) => a.name.localeCompare(b.name));
+
+        // Заполняем модель без pixbuf-колонки (не задаём null)
+        for (const t of themes) {
+            const iter = this.store.append();
+            this.store.set(iter, [1, 2, 3], [t.name, t.dir, t.example]);
+        }
+
+        // Асинхронная загрузка превью по одной строке за такт
+        let idx = 0;
+        const loadNextPreview = () => {
+            if (idx >= themes.length) return false;
+            const rowIdx = idx;
+            const t = themes[rowIdx];
+            idx++;
+
+            // Если Example нет — используем 'folder' как дефолтную иконку
+            const exampleName = t.example || 'folder';
+            const pix = this.findExampleIcon(t, exampleName);
+            if (pix) {
+                const [ok, iter] = this.store.get_iter_from_string(String(rowIdx));
+                if (ok && iter) {
+                    this.store.set(iter, [0], [pix]);
+                }
+            }
+
+            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, loadNextPreview);
+            return false;
+        };
+
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, loadNextPreview);
+    }
+
+    findExampleIcon(themeInfo, exampleName) {
+        if (!exampleName) exampleName = 'folder';
+
+        // 1. Пытаемся загрузить иконку через Gtk.IconTheme,
+        //    указав путь и имя конкретной темы.
+        //    Это корректно работает с SVG, симлинками, наследованием
+        //    (Inherits=), размерами и т.д. — то же самое, что делает
+        //    xfce4-appearance-settings.
+        try {
+            const it = Gtk.IconTheme.new();
+            const parent = GLib.path_get_dirname(themeInfo.dir);
+            it.append_search_path(parent);
+            it.set_custom_theme(themeInfo.dirName);
+
+            if (it.has_icon(exampleName)) {
+                const pix = it.load_icon(exampleName, 48, 0);
+                if (pix) return pix;
+            }
+
+            // Fallback 1: folder из той же темы (или унаследованный ею)
+            if (exampleName !== 'folder' && it.has_icon('folder')) {
+                const pix = it.load_icon('folder', 48, 0);
+                if (pix) return pix;
+            }
+        } catch (e) {
+            // если что-то не так с путём/именем — падаем дальше
+        }
+
+        // 2. Последний резерв: folder из системной темы по умолчанию
+        try {
+            const sys = Gtk.IconTheme.get_default();
+            if (sys && sys.has_icon('folder')) {
+                const pix = sys.load_icon('folder', 48, 0);
+                if (pix) return pix;
+            }
+        } catch (e) {}
+
+        return null;
+    }
+
+    run() {
+        const response = this.dialog.run();
+        const selectedPaths = [];
+
+        if (response === Gtk.ResponseType.OK) {
+            const selection = this.view.get_selection();
+            const model = this.store;
+
+            // Число строк верхнего уровня. Модель плоская, iter = null
+            // означает "верхний уровень" — это стандартное поведение.
+            const n = model.iter_n_children(null);
+
+            for (let i = 0; i < n; i++) {
+                // get_iter_from_string в GJS возвращает [ok, iter]
+                const [ok, iter] = model.get_iter_from_string(String(i));
+                if (!ok || !iter) continue;
+
+                if (!selection.iter_is_selected(iter)) continue;
+
+                const dir = model.get_value(iter, 2);
+                if (dir) {
+                    selectedPaths.push(
+                        GLib.build_filenamev([dir, 'index.theme']));
+                }
+            }
+        }
+
+        this.dialog.destroy();
+        return selectedPaths;
     }
 }
 
 // =====================================================================
-// ГРАФИЧЕСКОЕ ОКНО СРАВНЕНИЯ: строки = размеры, столбцы = темы
+// ГРАФИЧЕСКОЕ ОКНО СРАВНЕНИЯ
 // =====================================================================
 
 class GraphicalComparisonWindow {
     constructor(parent, app, iconName) {
         this.app = app;
         this.iconName = iconName;
-
-        let entry = app.iconIndex.get(iconName);
-        this.occurrences = entry ? entry.occurrences : [];
-
-        // Список размеров — из прочитанных тем
-        let sizeSet = new Set();
-        for (let ti = 0; ti < app.themes.length; ti++) {
-            for (let [dirName, info] of app.themes[ti].directories) {
-                if (info.size != null) sizeSet.add(info.size);
-            }
-        }
-        this.availableSizes = Array.from(sizeSet).sort(function(a, b) { return a - b; });
-        if (this.availableSizes.length === 0) {
-            this.availableSizes = [16, 22, 24, 32, 48, 64];
-        }
-
-        // Начальный размер — ближайший к 48, но не больше 64
-        let def = this.availableSizes[0];
-        let best = -1;
-        for (let i = 0; i < this.availableSizes.length; i++) {
-            let s = this.availableSizes[i];
-            if (s <= 64 && s > best) { best = s; def = s; }
-        }
-        if (best < 0) def = this.availableSizes[0];
-        this.displaySize = def;
+        this.previewSize = 48;
 
         this.window = new Gtk.Window({
             title: 'Visual comparison: ' + iconName,
@@ -281,6 +558,21 @@ class GraphicalComparisonWindow {
         return 999999;
     }
 
+    collectSizes(occurrences) {
+        const set = new Set();
+        for (const occ of occurrences) {
+            if (occ.size != null) set.add(occ.size);
+        }
+        return Array.from(set).sort((a, b) => a - b);
+    }
+
+    pickDefaultSize(sizes) {
+        if (sizes.length === 0) return 48;
+        if (sizes.indexOf(48) >= 0) return 48;
+        for (const s of sizes) if (s >= 48) return s;
+        return sizes[sizes.length - 1];
+    }
+
     buildUI() {
         let mainBox = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
@@ -288,83 +580,132 @@ class GraphicalComparisonWindow {
             margin: 8
         });
 
+        let entry = this.app.iconIndex.get(this.iconName);
+        let occurrences = entry ? entry.occurrences : [];
+        this.occurrences = occurrences;
+
         // ---------- Шапка ----------
         let header = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 10 });
 
         let preview = new Gtk.Image();
         preview.set_size_request(64, 64);
         let pb = null;
-        for (let i = 0; i < this.occurrences.length; i++) {
-            if (!this.occurrences[i].isSymlink) {
-                pb = pixbufFromFile(this.occurrences[i].fullPath, 64);
+        for (let i = 0; i < occurrences.length; i++) {
+            if (!occurrences[i].isSymlink) {
+                pb = pixbufFromFile(occurrences[i].fullPath, 64);
                 if (pb) break;
             }
         }
         if (!pb) {
-            for (let i = 0; i < this.occurrences.length; i++) {
-                pb = pixbufFromFile(this.occurrences[i].fullPath, 64);
+            for (let i = 0; i < occurrences.length; i++) {
+                pb = pixbufFromFile(occurrences[i].fullPath, 64);
                 if (pb) break;
             }
         }
         preview.set_from_pixbuf(pb);
         header.pack_start(preview, false, false, 0);
 
-        let infoBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 3 });
-
+        let themesCount = this.app.themes.length;
         let hdrLabel = new Gtk.Label({
-            label: '<b>' + escapeMarkup(this.iconName) + '</b>',
+            label: '<b>' + escapeMarkup(this.iconName) + '</b>\n' +
+                   'Rows = size, Columns = theme (' + themesCount + ')',
             use_markup: true,
             halign: Gtk.Align.START
         });
-        infoBox.pack_start(hdrLabel, false, false, 0);
+        header.pack_start(hdrLabel, false, false, 0);
 
-        let subLabel = new Gtk.Label({
-            label: 'Rows = size, Columns = theme (' + this.app.themes.length + ')',
-            halign: Gtk.Align.START
-        });
-        infoBox.pack_start(subLabel, false, false, 0);
+        // Список размеров превью в таблице — справа от имени.
+        const sizes = this.collectSizes(occurrences);
+        if (sizes.length === 0) sizes.push(48);
+        this.previewSize = this.pickDefaultSize(sizes);
 
-        header.pack_start(infoBox, true, true, 0);
+        // Editable combo: можно выбрать из списка или ввести вручную.
+        this.sizeCombo = Gtk.ComboBoxText.new_with_entry();
+        for (const s of sizes) this.sizeCombo.append_text(String(s));
 
-        // ---------- Выбор размера отображения ----------
-        let sizeBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 5 });
-        sizeBox.pack_start(new Gtk.Label({ label: 'Display size:' }), false, false, 0);
+        let activeIdx = sizes.indexOf(this.previewSize);
+        if (activeIdx < 0) activeIdx = 0;
+        this.sizeCombo.set_active(activeIdx);
 
-        this.sizeCombo = new Gtk.ComboBoxText();
-        for (let i = 0; i < this.availableSizes.length; i++) {
-            this.sizeCombo.append_text(this.availableSizes[i] + ' px');
+        // Настраиваем встроенный entry — ширину и поведение.
+        this.sizeEntry = this.sizeCombo.get_child();
+        if (this.sizeEntry) {
+            this.sizeEntry.set_width_chars(5);
+            this.sizeEntry.set_max_length(6);
         }
-        let idx = this.availableSizes.indexOf(this.displaySize);
-        if (idx < 0) idx = 0;
-        this.sizeCombo.set_active(idx);
-        this.sizeCombo.connect('changed', () => {
-            let a = this.sizeCombo.get_active();
-            if (a < 0 || a >= this.availableSizes.length) return;
-            this.displaySize = this.availableSizes[a];
-            this.populateTable();
-        });
-        sizeBox.pack_start(this.sizeCombo, false, false, 0);
 
-        header.pack_start(sizeBox, false, false, 0);
+        this.sizeCombo.set_tooltip_text(
+            'Size of the icons shown in the table (select or type a number)');
+        this.sizeCombo.connect('changed', () => {
+            // При редактировании entry — берём текст из него;
+            // при выборе из списка — из active_text.
+            let t = null;
+            if (this.sizeEntry) t = this.sizeEntry.get_text();
+            if (!t) t = this.sizeCombo.get_active_text();
+            if (!t) return;
+
+            const v = parseInt(t, 10);
+            if (!isNaN(v) && v > 0 && v <= 1024 && v !== this.previewSize) {
+                this.previewSize = v;
+                this.fillStore();
+            }
+        });
+
+        // pack_end кладёт первый виджет в самый конец.
+        // Сначала комбо (окажется правее), потом метку (слева от него).
+        header.pack_end(this.sizeCombo, false, false, 0);
+
+        let sizeLabel = new Gtk.Label({
+            label: 'Preview size:',
+            halign: Gtk.Align.END
+        });
+        header.pack_end(sizeLabel, false, false, 0);
 
         mainBox.pack_start(header, false, false, 0);
 
+        if (themesCount === 0 || occurrences.length === 0) {
+            let empty = new Gtk.Label({
+                label: '<i>No themes loaded, or icon not found in any theme.</i>',
+                use_markup: true,
+                halign: Gtk.Align.START
+            });
+            mainBox.pack_start(empty, false, false, 0);
+            this.window.add(mainBox);
+            return;
+        }
+
+        // ---------- Строки (уникальные размеры) ----------
+        this.rowMap = new Map();
+        for (let i = 0; i < occurrences.length; i++) {
+            let key = this.rowKeyOf(occurrences[i]);
+            if (!this.rowMap.has(key)) {
+                this.rowMap.set(key, this.rowSortKeyOf(occurrences[i]));
+            }
+        }
+        this.rows = Array.from(this.rowMap.keys());
+        this.rows.sort((a, b) => {
+            let ka = this.rowMap.get(a);
+            let kb = this.rowMap.get(b);
+            if (ka !== kb) return ka - kb;
+            return a.localeCompare(b);
+        });
+
         // ---------- Модель ----------
-        this.store = new Gtk.ListStore();
         let colTypes = [GObject.TYPE_STRING, GObject.TYPE_INT];
-        for (let i = 0; i < this.app.themes.length; i++) {
+        for (let i = 0; i < themesCount; i++) {
             colTypes.push(GdkPixbuf.Pixbuf);
             colTypes.push(GObject.TYPE_STRING);
             colTypes.push(GObject.TYPE_STRING);
         }
+        this.store = new Gtk.ListStore();
         this.store.set_column_types(colTypes);
 
+        // ---------- TreeView ----------
         this.view = new Gtk.TreeView({
             model: this.store,
             headers_clickable: true
         });
 
-        // Колонка Size
         let sizeR = new Gtk.CellRendererText();
         sizeR.set_property('xpad', 6);
         let sizeC = new Gtk.TreeViewColumn({ title: 'Size' });
@@ -377,7 +718,6 @@ class GraphicalComparisonWindow {
         sizeC.set_clickable(true);
         this.view.append_column(sizeC);
 
-        // Колонки тем
         for (let ti = 0; ti < this.app.themes.length; ti++) {
             let pixIdx = 2 + ti * 3;
             let bgIdx  = 3 + ti * 3;
@@ -395,16 +735,18 @@ class GraphicalComparisonWindow {
             c.add_attribute(r, 'cell-background', bgIdx);
             c.set_min_width(56);
             c.set_resizable(true);
-            c.set_expand(false);
             this.view.append_column(c);
         }
+
+        this.store.set_sort_column_id(1, Gtk.SortType.ASCENDING);
+
+        this.fillStore();
 
         let scroll = new Gtk.ScrolledWindow();
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC);
         scroll.add(this.view);
         mainBox.pack_start(scroll, true, true, 0);
 
-        // Легенда
         let legend = new Gtk.Label({
             label: '<small>White = file, blue = symlink, gray = missing</small>',
             use_markup: true,
@@ -412,7 +754,6 @@ class GraphicalComparisonWindow {
         });
         mainBox.pack_start(legend, false, false, 0);
 
-        // Кнопка Close
         let btnBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 5 });
         btnBox.pack_start(new Gtk.Label({ label: '' }), true, true, 0);
         let closeBtn = new Gtk.Button({ label: 'Close' });
@@ -421,43 +762,25 @@ class GraphicalComparisonWindow {
         mainBox.pack_start(btnBox, false, false, 0);
 
         this.window.add(mainBox);
-
-        this.populateTable();
     }
 
-    // ==================== ЗАПОЛНЕНИЕ ТАБЛИЦЫ ====================
-    populateTable() {
+    fillStore() {
         this.store.clear();
 
-        if (this.app.themes.length === 0 || this.occurrences.length === 0) return;
+        const occurrences = this.occurrences;
+        const size = this.previewSize;
+        const self = this;
 
-        // Уникальные размеры (строки)
-        let rowMap = new Map();
-        for (let i = 0; i < this.occurrences.length; i++) {
-            let key = this.rowKeyOf(this.occurrences[i]);
-            if (!rowMap.has(key)) rowMap.set(key, this.rowSortKeyOf(this.occurrences[i]));
-        }
-        let rows = Array.from(rowMap.keys());
-        rows.sort(function(a, b) {
-            let ka = rowMap.get(a);
-            let kb = rowMap.get(b);
-            if (ka !== kb) return ka - kb;
-            return a.localeCompare(b);
-        });
-
-        let self = this;
-        let displaySize = this.displaySize;
-
-        for (let ri = 0; ri < rows.length; ri++) {
-            let sz = rows[ri];
-            let rowData = [sz, rowMap.get(sz)];
+        for (let ri = 0; ri < this.rows.length; ri++) {
+            let sz = this.rows[ri];
+            let rowData = [sz, this.rowMap.get(sz)];
 
             for (let ti = 0; ti < this.app.themes.length; ti++) {
                 let theme = this.app.themes[ti];
                 let match = null;
 
-                for (let oi = 0; oi < this.occurrences.length; oi++) {
-                    let occ = this.occurrences[oi];
+                for (let oi = 0; oi < occurrences.length; oi++) {
+                    let occ = occurrences[oi];
                     if (occ.theme !== theme) continue;
                     if (self.rowKeyOf(occ) !== sz) continue;
                     match = occ;
@@ -465,13 +788,13 @@ class GraphicalComparisonWindow {
                 }
 
                 if (match) {
-                    let pix = self.loadPixbufNearest(match.fullPath, displaySize);
+                    let pix = pixbufFromFile(match.fullPath, size);
                     let bg = match.isSymlink ? '#D9E6F2' : '#FFFFFF';
-                    rowData.push(pix);
+                    rowData.push(pix || getTransparentPixbuf());
                     rowData.push(bg);
                     rowData.push(match.isSymlink ? 'symlink' : 'file');
                 } else {
-                    rowData.push(null);
+                    rowData.push(getTransparentPixbuf());
                     rowData.push('#F0F0F0');
                     rowData.push('');
                 }
@@ -482,40 +805,11 @@ class GraphicalComparisonWindow {
             for (let k = 0; k < rowData.length; k++) idx.push(k);
             this.store.set(iter, idx, rowData);
         }
-
-        this.store.set_sort_column_id(1, Gtk.SortType.ASCENDING);
-    }
-
-    // ==================== ПИКСБУФ БЕЗ СГЛАЖИВАНИЯ ====================
-    loadPixbufNearest(absPath, size) {
-        try {
-            let raw = GdkPixbuf.Pixbuf.new_from_file(absPath);
-            let w = raw.get_width();
-            let h = raw.get_height();
-            if (w === size && h === size) return raw;
-
-            let scale = Math.min(size / w, size / h);
-            let newW = Math.max(1, Math.round(w * scale));
-            let newH = Math.max(1, Math.round(h * scale));
-            let scaled = raw.scale_simple(newW, newH, GdkPixbuf.InterpType.NEAREST);
-
-            if (newW === size && newH === size) return scaled;
-
-            let canvas = GdkPixbuf.Pixbuf.new(
-                GdkPixbuf.Colorspace.RGB, true, 8, size, size);
-            canvas.fill(0x00000000);
-            scaled.copy_area(0, 0, newW, newH, canvas,
-                Math.floor((size - newW) / 2),
-                Math.floor((size - newH) / 2));
-            return canvas;
-        } catch (e) {
-            return null;
-        }
     }
 }
 
 // =====================================================================
-// ОКНО СРАВНЕНИЯ
+// ОКНО ТЕКСТОВОГО СРАВНЕНИЯ
 // =====================================================================
 
 class ComparisonWindow {
@@ -531,7 +825,6 @@ class ComparisonWindow {
             modal: false,
             window_position: Gtk.WindowPosition.CENTER
         });
-        this.window.connect('destroy', function() {});
 
         this.buildUI();
         this.window.show_all();
@@ -544,7 +837,6 @@ class ComparisonWindow {
             margin: 8
         });
 
-        // ---- Шапка ----
         let header = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 10 });
 
         let preview = new Gtk.Image();
@@ -584,17 +876,16 @@ class ComparisonWindow {
 
         mainBox.pack_start(header, false, false, 0);
 
-        // ---- Таблица ----
         let store = new Gtk.ListStore();
         store.set_column_types([
-            GObject.TYPE_STRING, // 0 theme
-            GObject.TYPE_STRING, // 1 dir
-            GObject.TYPE_STRING, // 2 context
-            GObject.TYPE_STRING, // 3 size
-            GObject.TYPE_STRING, // 4 type
-            GObject.TYPE_STRING, // 5 target
-            GObject.TYPE_STRING, // 6 full path
-            GObject.TYPE_STRING  // 7 reverse count
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING
         ]);
 
         let view = new Gtk.TreeView({ model: store, headers_clickable: true });
@@ -647,7 +938,6 @@ class ComparisonWindow {
         scroll.add(view);
         mainBox.pack_start(scroll, true, true, 0);
 
-        // ---- Кнопка закрытия ----
         let btnBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 5 });
         btnBox.pack_start(new Gtk.Label({ label: '' }), true, true, 0);
         let closeBtn = new Gtk.Button({ label: 'Close' });
@@ -666,7 +956,7 @@ class ComparisonWindow {
 class MainApp {
     constructor() {
         this.themes = [];
-        this.iconIndex = new Map();   // name -> {name, occurrences[], themes:Set, contexts:Set}
+        this.iconIndex = new Map();
         this.filteredNames = [];
         this.currentName = null;
         this.filterTimer = null;
@@ -689,13 +979,17 @@ class MainApp {
             margin: 5
         });
 
-        // ---------- Тулбар ----------
         let toolbar = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 5 });
 
         let addBtn = new Gtk.Button({ label: 'Add Theme...' });
         addBtn.set_tooltip_text('Add an icon theme (select its directory or index.theme file)');
         addBtn.connect('clicked', () => this.onAddTheme());
         toolbar.pack_start(addBtn, false, false, 0);
+
+        let addSysBtn = new Gtk.Button({ label: 'Add system theme' });
+        addSysBtn.set_tooltip_text('Browse and add installed system icon themes');
+        addSysBtn.connect('clicked', () => this.onAddSystemThemes());
+        toolbar.pack_start(addSysBtn, false, false, 0);
 
         let removeBtn = new Gtk.Button({ label: 'Remove Theme...' });
         removeBtn.set_tooltip_text('Remove a theme from the comparison');
@@ -719,7 +1013,6 @@ class MainApp {
 
         mainBox.pack_start(toolbar, false, false, 0);
 
-        // ---------- Строка тегов тем ----------
         this.themesBar = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 4 });
         let themesScroll = new Gtk.ScrolledWindow();
         themesScroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER);
@@ -727,7 +1020,6 @@ class MainApp {
         themesScroll.add(this.themesBar);
         mainBox.pack_start(themesScroll, false, false, 0);
 
-        // ---------- Основной сплит ----------
         let split = new Gtk.Box({
             orientation: Gtk.Orientation.HORIZONTAL,
             spacing: 5,
@@ -735,7 +1027,6 @@ class MainApp {
             vexpand: true
         });
 
-        // --- Левая: таблица имён значков ---
         let leftBox = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
             hexpand: true,
@@ -745,12 +1036,12 @@ class MainApp {
 
         this.listStore = new Gtk.ListStore();
         this.listStore.set_column_types([
-            GObject.TYPE_STRING, // 0 name
-            GObject.TYPE_STRING, // 1 color
-            GObject.TYPE_STRING, // 2 coverage
-            GObject.TYPE_STRING, // 3 contexts
-            GObject.TYPE_STRING, // 4 status
-            GObject.TYPE_STRING  // 5 baseName (lookup)
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING
         ]);
 
         this.treeView = new Gtk.TreeView({
@@ -809,7 +1100,6 @@ class MainApp {
 
         split.pack_start(leftBox, true, true, 0);
 
-        // --- Правая: инфо о выделенном значке ---
         let rightBox = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
             spacing: 5,
@@ -839,49 +1129,48 @@ class MainApp {
         infoTop.pack_start(this.infoText, true, true, 0);
         rightBox.pack_start(infoTop, false, false, 0);
 
-this.infoStore = new Gtk.ListStore();
-this.infoStore.set_column_types([
-    GObject.TYPE_STRING, // 0 theme
-    GObject.TYPE_STRING, // 1 dir
-    GObject.TYPE_STRING, // 2 context
-    GObject.TYPE_STRING, // 3 size (текст)
-    GObject.TYPE_STRING, // 4 type
-    GObject.TYPE_STRING, // 5 target
-    GObject.TYPE_INT     // 6 size sort key (скрытая, только для сортировки)
-]);
+        this.infoStore = new Gtk.ListStore();
+        this.infoStore.set_column_types([
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_STRING,
+            GObject.TYPE_INT
+        ]);
 
         this.infoView = new Gtk.TreeView({
             model: this.infoStore,
             headers_clickable: true
         });
 
-// [title, textIndex, expand, minWidth, sortColumnId]
-let infoCols = [
-    ['Theme',   0, false, 100, 0],
-    ['Dir',     1, true,  120, 1],
-    ['Context', 2, false, 80,  2],
-    ['Size',    3, false, 50,  6],   // сортировка по скрытому int-столбцу
-    ['Type',    4, false, 70,  4],
-    ['Target',  5, true,  120, 5]
-];
-this.infoView.connect('cursor-changed', () => this.onInfoRowSelected());
-for (let i = 0; i < infoCols.length; i++) {
-    let title = infoCols[i][0], idx = infoCols[i][1],
-        expand = infoCols[i][2], minw = infoCols[i][3],
-        sortIdx = infoCols[i][4];
-    let r = new Gtk.CellRendererText();
-    r.set_property('ellipsize', 3);
-    let c = new Gtk.TreeViewColumn({ title: title });
-    c.pack_start(r, true);
-    c.add_attribute(r, 'text', idx);
-    c.set_resizable(true);
-    c.set_expand(expand);
-    c.set_min_width(minw);
-    c.set_sort_column_id(sortIdx);
-    c.set_clickable(true);
-    this.infoView.append_column(c);
-}
-this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
+        let infoCols = [
+            ['Theme',   0, false, 100, 0],
+            ['Dir',     1, true,  120, 1],
+            ['Context', 2, false, 80,  2],
+            ['Size',    3, false, 50,  6],
+            ['Type',    4, false, 70,  4],
+            ['Target',  5, true,  120, 5]
+        ];
+        this.infoView.connect('cursor-changed', () => this.onInfoRowSelected());
+        for (let i = 0; i < infoCols.length; i++) {
+            let title = infoCols[i][0], idx = infoCols[i][1],
+                expand = infoCols[i][2], minw = infoCols[i][3],
+                sortIdx = infoCols[i][4];
+            let r = new Gtk.CellRendererText();
+            r.set_property('ellipsize', 3);
+            let c = new Gtk.TreeViewColumn({ title: title });
+            c.pack_start(r, true);
+            c.add_attribute(r, 'text', idx);
+            c.set_resizable(true);
+            c.set_expand(expand);
+            c.set_min_width(minw);
+            c.set_sort_column_id(sortIdx);
+            c.set_clickable(true);
+            this.infoView.append_column(c);
+        }
+        this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
 
         let infoScroll = new Gtk.ScrolledWindow();
         infoScroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC);
@@ -899,10 +1188,14 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
 
         mainBox.pack_start(split, true, true, 0);
 
-        // ---------- Статусбар ----------
-        this.statusbar = new Gtk.Statusbar();
-        this.statusContextId = this.statusbar.get_context_id('main');
-        mainBox.pack_start(this.statusbar, false, false, 0);
+        this.statusBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 5 });
+        this.statusLabel = new Gtk.Label({
+            label: '',
+            halign: Gtk.Align.START,
+            margin_start: 4
+        });
+        this.statusBox.pack_start(this.statusLabel, false, false, 0);
+        mainBox.pack_start(this.statusBox, false, false, 0);
 
         this.window.add(mainBox);
         this.window.show_all();
@@ -911,10 +1204,8 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
         this.updateStatus();
     }
 
-    // ================= СТАТУС =================
     setStatus(msg) {
-        this.statusbar.remove_all(this.statusContextId);
-        this.statusbar.push(this.statusContextId, msg);
+        this.statusLabel.set_text(msg);
     }
 
     updateStatus() {
@@ -922,7 +1213,6 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
                        this.iconIndex.size + ' unique icon name(s)');
     }
 
-    // ================= ТЕГИ ТЕМ =================
     updateThemesBar() {
         let children = this.themesBar.get_children();
         for (let i = 0; i < children.length; i++) children[i].destroy();
@@ -967,7 +1257,6 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
         this.themesBar.show_all();
     }
 
-    // ================= ДОБАВЛЕНИЕ =================
     onAddTheme() {
         let dialog = new Gtk.FileChooserDialog({
             title: 'Select icon theme directory',
@@ -985,12 +1274,20 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
         if (path) this.addThemeByPath(path);
     }
 
-    addThemeByPath(path) {
-        // Принимаем и папку, и файл index.theme
+    onAddSystemThemes() {
+        const dlg = new SystemThemesDialog(this.window, this);
+        const selectedPaths = dlg.run();
+        for (const p of selectedPaths) {
+            this.addThemeByPath(p);
+        }
+    }
+
+    async addThemeByPath(path) {
         let file = Gio.File.new_for_path(path);
         let info;
         try {
-            info = file.query_info('standard::type', Gio.FileQueryInfoFlags.NONE, null);
+            info = await file.query_info_async('standard::type',
+                Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null);
         } catch (e) {
             this.showError('Cannot access:\n' + path);
             return;
@@ -1016,7 +1313,8 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
         }
 
         let theme = new IconTheme(path);
-        if (!theme.load()) {
+        const ok = await theme.load();
+        if (!ok) {
             this.showError('Failed to load theme:\n' + (theme.error || 'unknown error'));
             return;
         }
@@ -1028,7 +1326,6 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
         this.updateStatus();
     }
 
-    // ================= УДАЛЕНИЕ =================
     onRemoveTheme() {
         if (this.themes.length === 0) {
             this.showError('No themes loaded.');
@@ -1096,14 +1393,14 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
         dialog.destroy();
     }
 
-    // ================= ОБНОВЛЕНИЕ =================
-    onRefreshAll() {
+    async onRefreshAll() {
         for (let i = 0; i < this.themes.length; i++) {
             let t = this.themes[i];
             t.icons.clear();
             t.directories.clear();
             t.directoryList = [];
-            t.load();
+            t._loaded = false;
+            await t.load();
         }
         this.rebuildIndex();
         this.applyFilter();
@@ -1135,7 +1432,6 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
         }
     }
 
-    // ================= ФИЛЬТР =================
     onFilterChanged() {
         if (this.filterTimer) {
             GLib.source_remove(this.filterTimer);
@@ -1203,7 +1499,6 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
         }
     }
 
-    // ================= ВЫБОР =================
     onIconSelected() {
         let [ok, model, iter] = this.treeView.get_selection().get_selected();
         if (!ok || !iter) return;
@@ -1215,7 +1510,6 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
         this.currentName = name;
 
         this.showIconInfo(name);
-
     }
 
     showIconInfo(name) {
@@ -1256,152 +1550,141 @@ this.infoStore.set_sort_column_id(0, Gtk.SortType.ASCENDING);
 
         this.infoText.set_markup(infoText);
 
-for (let i = 0; i < entry.occurrences.length; i++) {
-    let occ = entry.occurrences[i];
-    let sizeText = occ.size != null ? String(occ.size) : '';
-    let sizeKey;
-    if (occ.size != null) sizeKey = occ.size;
-    else if (occ.type) sizeKey = 999999;
-    else sizeKey = -1;
+        for (let i = 0; i < entry.occurrences.length; i++) {
+            let occ = entry.occurrences[i];
+            let sizeText = occ.size != null ? String(occ.size) : '';
+            let sizeKey;
+            if (occ.size != null) sizeKey = occ.size;
+            else if (occ.type) sizeKey = 999999;
+            else sizeKey = -1;
 
-    let iter = this.infoStore.append();
-    this.infoStore.set(iter, [0, 1, 2, 3, 4, 5, 6], [
-        occ.theme.name,
-        occ.relPath,
-        occ.context || '',
-        sizeText,
-        occ.isSymlink ? 'symlink' : 'file',
-        occ.target || '',
-        sizeKey
-    ]);
-}
+            let iter = this.infoStore.append();
+            this.infoStore.set(iter, [0, 1, 2, 3, 4, 5, 6], [
+                occ.theme.name,
+                occ.relPath,
+                occ.context || '',
+                sizeText,
+                occ.isSymlink ? 'symlink' : 'file',
+                occ.target || '',
+                sizeKey
+            ]);
+        }
 
-// В самом конце showIconInfo(), после заполнения infoStore:
-GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-    let iter = this.infoStore.get_iter_first();
-    if (iter) {
-        let path = new Gtk.TreePath();
-        path.append_index(0);
-        this.infoView.set_cursor(path, null, false);
-    }
-    return false;
-});
-    }
-
-onInfoRowSelected() {
-    let [ok, model, iter] = this.infoView.get_selection().get_selected();
-    if (!ok || !iter) return;
-
-    // В infoStore:
-    // 0 theme, 1 dir (relPath), 2 context, 3 size, 4 type, 5 target, 6 sizeKey
-    let relPath = model.get_value(iter, 1);
-    if (!relPath) return;
-
-    let entry = this.iconIndex.get(this.currentName);
-    if (!entry) return;
-
-    // Ищем occurrence, соответствующий выбранной строке
-    let match = null;
-    for (let i = 0; i < entry.occurrences.length; i++) {
-        let occ = entry.occurrences[i];
-        if (occ.relPath !== relPath) continue;
-
-        // На всякий случай сверяем тему и цель, чтобы различить
-        // одноимённые записи (маловероятно, но возможно)
-        let themeName = model.get_value(iter, 0);
-        if (occ.theme.name !== themeName) continue;
-        match = occ;
-        break;
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            let iter = this.infoStore.get_iter_first();
+            if (iter) {
+                let path = new Gtk.TreePath();
+                path.append_index(0);
+                this.infoView.set_cursor(path, null, false);
+            }
+            return false;
+        });
     }
 
-    if (!match) return;
+    onInfoRowSelected() {
+        let [ok, model, iter] = this.infoView.get_selection().get_selected();
+        if (!ok || !iter) return;
 
-    let pix = pixbufFromFile(match.fullPath, 64);
-    this.infoImage.set_from_pixbuf(pix);
-}
+        let relPath = model.get_value(iter, 1);
+        if (!relPath) return;
 
+        let entry = this.iconIndex.get(this.currentName);
+        if (!entry) return;
 
-onIconActivated() {
-    this.openGraphicalComparison();
-}
+        let match = null;
+        for (let i = 0; i < entry.occurrences.length; i++) {
+            let occ = entry.occurrences[i];
+            if (occ.relPath !== relPath) continue;
+            let themeName = model.get_value(iter, 0);
+            if (occ.theme.name !== themeName) continue;
+            match = occ;
+            break;
+        }
 
-openGraphicalComparison() {
-    let [ok, model, iter] = this.treeView.get_selection().get_selected();
-    if (!ok || !iter) return;
+        if (!match) return;
 
-    let name = model.get_value(iter, 5);
-    if (!name) return;
-
-    let entry = this.iconIndex.get(name);
-    if (!entry) return;
-
-    new GraphicalComparisonWindow(this.window, this, name);
-}
-
-openTextComparison() {
-    let [ok, model, iter] = this.treeView.get_selection().get_selected();
-    if (!ok || !iter) return;
-
-    let name = model.get_value(iter, 5);
-    if (!name) return;
-
-    let entry = this.iconIndex.get(name);
-    if (!entry) return;
-
-    new ComparisonWindow(this.window, name, entry.occurrences);
-}
-
-onTreeRightClick(widget, event) {
-    let btn = event.get_button()[1];
-    if (btn !== 3) return false;   // только правая кнопка
-
-    let coords;
-    try {
-        coords = event.get_coords();
-    } catch (e) {
-        coords = null;
+        let pix = pixbufFromFile(match.fullPath, 64);
+        this.infoImage.set_from_pixbuf(pix);
     }
 
-    let x, y;
-    if (coords && coords.length >= 2) {
-        x = coords[0];
-        y = coords[1];
-    } else {
-        x = event.x;
-        y = event.y;
+    onIconActivated() {
+        this.openGraphicalComparison();
     }
 
-    let pathInfo = this.treeView.get_path_at_pos(Math.floor(x), Math.floor(y));
-    if (!pathInfo) return false;
+    openGraphicalComparison() {
+        let [ok, model, iter] = this.treeView.get_selection().get_selected();
+        if (!ok || !iter) return;
 
-    this.treeView.get_selection().select_path(pathInfo[0]);
-    this.onIconSelected();
+        let name = model.get_value(iter, 5);
+        if (!name) return;
 
-    let menu = new Gtk.Menu();
+        let entry = this.iconIndex.get(name);
+        if (!entry) return;
 
-    let visualItem = new Gtk.MenuItem({ label: 'Visual comparison' });
-    visualItem.connect('activate', () => this.openGraphicalComparison());
-    menu.append(visualItem);
-
-    let textItem = new Gtk.MenuItem({ label: 'Text comparison' });
-    textItem.connect('activate', () => this.openTextComparison());
-    menu.append(textItem);
-
-    menu.show_all();
-
-    // В GTK 3.22+ предпочтительный способ — popup_at_pointer.
-    // Для более старых версий — fallback на popup().
-    try {
-        menu.popup_at_pointer(event);
-    } catch (e) {
-        let time = (event.get_time ? event.get_time() : 0);
-        menu.popup(null, null, null, btn, time);
+        new GraphicalComparisonWindow(this.window, this, name);
     }
 
-    return true;
-}
+    openTextComparison() {
+        let [ok, model, iter] = this.treeView.get_selection().get_selected();
+        if (!ok || !iter) return;
 
-    // ================= ДИАЛОГ ОШИБКИ =================
+        let name = model.get_value(iter, 5);
+        if (!name) return;
+
+        let entry = this.iconIndex.get(name);
+        if (!entry) return;
+
+        new ComparisonWindow(this.window, name, entry.occurrences);
+    }
+
+    onTreeRightClick(widget, event) {
+        let btn = event.get_button()[1];
+        if (btn !== 3) return false;
+
+        let coords;
+        try {
+            coords = event.get_coords();
+        } catch (e) {
+            coords = null;
+        }
+
+        let x, y;
+        if (coords && coords.length >= 2) {
+            x = coords[0];
+            y = coords[1];
+        } else {
+            x = event.x;
+            y = event.y;
+        }
+
+        let pathInfo = this.treeView.get_path_at_pos(Math.floor(x), Math.floor(y));
+        if (!pathInfo) return false;
+
+        this.treeView.get_selection().select_path(pathInfo[0]);
+        this.onIconSelected();
+
+        let menu = new Gtk.Menu();
+
+        let visualItem = new Gtk.MenuItem({ label: 'Visual comparison' });
+        visualItem.connect('activate', () => this.openGraphicalComparison());
+        menu.append(visualItem);
+
+        let textItem = new Gtk.MenuItem({ label: 'Text comparison' });
+        textItem.connect('activate', () => this.openTextComparison());
+        menu.append(textItem);
+
+        menu.show_all();
+
+        try {
+            menu.popup_at_pointer(event);
+        } catch (e) {
+            let time = (event.get_time ? event.get_time() : 0);
+            menu.popup(null, null, null, btn, time);
+        }
+
+        return true;
+    }
+
     showError(msg) {
         let dialog = new Gtk.MessageDialog({
             transient_for: this.window,
@@ -1421,7 +1704,6 @@ onTreeRightClick(widget, event) {
 
 let app = new MainApp();
 
-// Аргументы командной строки: пути к index.theme или папкам с ними.
 for (let i = 0; i < ARGV.length; i++) {
     let p = ARGV[i];
     if (!p) continue;
