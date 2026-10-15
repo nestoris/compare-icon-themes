@@ -796,6 +796,54 @@ class GraphicalComparisonWindow {
         return sizes[sizes.length - 1];
     }
 
+    // Выбор превью для верхнего левого угла.
+    // Приоритет:
+    //   1. Тема по умолчанию из настроек, если она присутствует
+    //      среди загруженных в это сравнение (сначала файл, потом симлинк).
+    //   2. Любая другая тема — как было раньше (сначала файл, потом симлинк).
+    findPreviewPixbuf(occurrences, size) {
+        const defTheme = (this.app && this.app.settings)
+            ? (this.app.settings.defaultTheme || '')
+            : '';
+
+        if (defTheme) {
+            // Сопоставление по имени каталога темы (это то, что
+            // хранится в настройках), а при отсутствии совпадений —
+            // по отображаемому имени (Name= из index.theme).
+            let matches = occurrences.filter(occ =>
+                occ.theme && GLib.path_get_basename(occ.theme.dir) === defTheme);
+            if (matches.length === 0) {
+                matches = occurrences.filter(occ =>
+                    occ.theme && occ.theme.name === defTheme);
+            }
+
+            for (const occ of matches) {
+                if (!occ.isSymlink) {
+                    const pb = pixbufFromFile(occ.fullPath, size);
+                    if (pb) return pb;
+                }
+            }
+            for (const occ of matches) {
+                const pb = pixbufFromFile(occ.fullPath, size);
+                if (pb) return pb;
+            }
+        }
+
+        // Fallback — прежнее поведение.
+        for (const occ of occurrences) {
+            if (!occ.isSymlink) {
+                const pb = pixbufFromFile(occ.fullPath, size);
+                if (pb) return pb;
+            }
+        }
+        for (const occ of occurrences) {
+            const pb = pixbufFromFile(occ.fullPath, size);
+            if (pb) return pb;
+        }
+
+        return null;
+    }
+
     buildUI() {
         let mainBox = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
@@ -812,20 +860,7 @@ class GraphicalComparisonWindow {
 
         let preview = new Gtk.Image();
         preview.set_size_request(64, 64);
-        let pb = null;
-        for (let i = 0; i < occurrences.length; i++) {
-            if (!occurrences[i].isSymlink) {
-                pb = pixbufFromFile(occurrences[i].fullPath, 64);
-                if (pb) break;
-            }
-        }
-        if (!pb) {
-            for (let i = 0; i < occurrences.length; i++) {
-                pb = pixbufFromFile(occurrences[i].fullPath, 64);
-                if (pb) break;
-            }
-        }
-        preview.set_from_pixbuf(pb);
+        preview.set_from_pixbuf(this.findPreviewPixbuf(occurrences, 64));
         header.pack_start(preview, false, false, 0);
 
         let themesCount = this.app.themes.length;
