@@ -1394,12 +1394,17 @@ class MainApp {
         themesScroll.add(this.themesBar);
         mainBox.pack_start(themesScroll, false, false, 0);
 
-        let split = new Gtk.Box({
+        // Разделяемая панель: пользователь может двигать границу.
+        let split = new Gtk.Paned({
             orientation: Gtk.Orientation.HORIZONTAL,
-            spacing: 5,
             hexpand: true,
-            vexpand: true
+            vexpand: true,
+            wide_handle: true
         });
+        // Стартовая позиция разделителя.
+        split.set_position(600);
+        // Запоминаем, чтобы потом можно было сохранить/восстановить.
+        this.splitPaned = split;
 
         let leftBox = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
@@ -1472,7 +1477,9 @@ class MainApp {
         listScroll.add(this.treeView);
         leftBox.pack_start(listScroll, true, true, 0);
 
-        split.pack_start(leftBox, true, true, 0);
+        // leftBox: resize=true (растёт вместе с окном),
+        //          shrink=false (не сжимать ниже его минимальной ширины).
+        split.pack1(leftBox, true, false);
 
         // Правая панель
         let rightBox = new Gtk.Box({
@@ -1637,7 +1644,10 @@ class MainApp {
 
         rightBox.pack_start(this.rightNotebook, true, true, 0);
 
-        split.pack_start(rightBox, false, false, 0);
+        // rightBox: resize=false — при растягивании окна
+        //           дополнительная ширина уходит в левую панель;
+        //           shrink=false — не сжимать ниже минимальной ширины.
+        split.pack2(rightBox, false, false);
 
         mainBox.pack_start(split, true, true, 0);
 
