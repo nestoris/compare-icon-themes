@@ -331,7 +331,7 @@ class IconTheme {
         this._loaded = false;
     }
 
-    async load() {
+    async load(progress) {
         if (this._loaded) return true;
         try {
             const keyFile = new GLib.KeyFile();
@@ -360,7 +360,7 @@ class IconTheme {
                 this.directories.set(dirName, info);
             }
 
-            await this.scanIconsAsync();
+            await this.scanIconsAsync(progress);
             this._loaded = true;
             return true;
         } catch (e) {
@@ -369,17 +369,31 @@ class IconTheme {
         }
     }
 
-    async scanIconsAsync() {
+    async scanIconsAsync(progress) {
         const validExts = ['.png', '.svg', '.xpm'];
         const self = this;
 
-        // Обрабатываем каталоги последовательно, а не через Promise.all.
-        // Каждый вызов enumerate_children_async держит открытый дескриптор,
-        // пока мы его не закроем. Параллельный обход десятков каталогов
-        // мгновенно упирается в системный лимит EMFILE ("Too many open files").
+        const totalDirs = this.directoryList.length;
+        let processedDirs = 0;
+
         for (const dirName of this.directoryList) {
+            if (progress && progress.isCancelled()) {
+                this.icons.clear();
+                throw new Error('Cancelled by user');
+            }
+
             const dirInfo = this.directories.get(dirName);
-            if (!dirInfo) continue;
+            if (!dirInfo) {
+                processedDirs++;
+                continue;
+            }
+
+            if (progress) {
+                const frac = totalDirs > 0 ? processedDirs / totalDirs : 0;
+                progress.setStatus(frac,
+                    'Scanning ' + dirName +
+                    ' (' + (processedDirs + 1) + '/' + totalDirs + ')...');
+            }
 
             const absDir = GLib.build_filenamev([this.dir, dirName]);
             const dir = Gio.File.new_for_path(absDir);
@@ -394,9 +408,10 @@ class IconTheme {
 
                 let fileInfos;
                 do {
+                    if (progress && progress.isCancelled()) {
+                        throw new Error('Cancelled by user');
+                    }
                     try {
-                        // Батч побольше — меньше итераций и дескрипторов
-                        // на каждый следующий вызов.
                         fileInfos = await enumerator.next_files_async(
                             200, GLib.PRIORITY_DEFAULT, null);
                     } catch (e) {
@@ -439,13 +454,92 @@ class IconTheme {
                     }
                 } while (fileInfos.length > 0);
             } catch (e) {
+                if (e && /Cancelled/.test(e.message || '')) throw e;
                 // Проблема в одном подкаталоге не должна ронять всю тему.
             } finally {
                 if (enumerator) {
                     try { enumerator.close(null); } catch (e) {}
                 }
             }
+
+            processedDirs++;
         }
+
+        if (progress) progress.setStatus(1.0, 'Done');
+    }
+}
+
+// =====================================================================
+// ДИАЛОГ ПРОГРЕССА С КНОПКОЙ ОТМЕНЫ
+// =====================================================================
+
+class ProgressDialog {
+    constructor(parent, title, text) {
+        this.cancelled = false;
+        this.dialog = new Gtk.Dialog({
+            title: title || 'Please wait',
+            transient_for: parent,
+            modal: true,
+            default_width: 440
+        });
+        this.dialog.set_deletable(false);
+        this.dialog.add_button('Cancel', Gtk.ResponseType.CANCEL);
+
+        const content = this.dialog.get_content_area();
+        content.set_spacing(8);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+
+        this.label = new Gtk.Label({
+            label: text || '',
+            halign: Gtk.Align.START,
+            xalign: 0,
+            wrap: true
+        });
+        content.pack_start(this.label, false, false, 0);
+
+        this.progress = new Gtk.ProgressBar();
+        this.progress.set_show_text(true);
+        this.progress.set_text('Preparing...');
+        this.progress.set_fraction(0);
+        content.pack_start(this.progress, false, false, 0);
+
+        this.dialog.connect('response', (d, resp) => {
+            if (resp === Gtk.ResponseType.CANCEL) {
+                this.cancelled = true;
+            }
+        });
+
+        this.dialog.show_all();
+        // Немедленно отрисовываем диалог, чтобы он появился до
+        // старта синхронной части загрузки.
+        while (Gtk.events_pending()) {
+            Gtk.main_iteration_do(false);
+        }
+    }
+
+    // fraction — 0.0..1.0, text — подпись на полосе.
+    // Покадрово "прокачиваем" главный цикл, чтобы отрисовались
+    // изменения и сработала кнопка Cancel.
+    setStatus(fraction, text) {
+        if (this.cancelled) return;
+        if (typeof fraction === 'number' && fraction >= 0 && fraction <= 1) {
+            this.progress.set_fraction(fraction);
+        }
+        if (text != null) this.progress.set_text(text);
+        while (Gtk.events_pending()) {
+            Gtk.main_iteration_do(false);
+        }
+    }
+
+    isCancelled() {
+        return this.cancelled;
+    }
+
+    close() {
+        try { this.dialog.destroy(); } catch (e) {}
     }
 }
 
@@ -1676,52 +1770,88 @@ class MainApp {
         let path = (response === Gtk.ResponseType.OK) ? dialog.get_filename() : null;
         dialog.destroy();
 
-        if (path) this.addThemeByPath(path);
+        if (path) {
+            this.loadThemesWithProgress([path]);
+        }
     }
 
     onAddSystemThemes() {
         const dlg = new SystemThemesDialog(this.window, this);
         const selectedPaths = dlg.run();
-        for (const p of selectedPaths) {
-            this.addThemeByPath(p);
+        if (selectedPaths && selectedPaths.length > 0) {
+            this.loadThemesWithProgress(selectedPaths);
         }
     }
 
-    async addThemeByPath(path) {
+    // Загружает одну или несколько тем последовательно, показывая
+    // модальный диалог прогресса с кнопкой Cancel. Для одиночной
+    // быстрой темы диалог просто мелькнёт.
+    async loadThemesWithProgress(paths) {
+        const n = paths.length;
+        const title = (n === 1) ? 'Loading theme' : 'Loading themes';
+        const text = (n === 1)
+            ? 'Loading ' + GLib.path_get_basename(GLib.path_get_dirname(paths[0]))
+            : 'Loading ' + n + ' theme(s)...';
+
+        const progress = new ProgressDialog(this.window, title, text);
+
+        try {
+            for (let i = 0; i < n; i++) {
+                if (progress.isCancelled()) break;
+                const name = GLib.path_get_basename(
+                    GLib.path_get_dirname(paths[i]));
+                progress.setStatus(i / n,
+                    (n > 1 ? ('(' + (i + 1) + '/' + n + ') ') : '') +
+                    'Loading ' + name + '...');
+                await this.addThemeByPath(paths[i], progress);
+            }
+        } catch (e) {
+            // уже показали ошибку или отменено — просто закрываем
+        } finally {
+            progress.close();
+        }
+    }
+
+    async addThemeByPath(path, progress) {
         let file = Gio.File.new_for_path(path);
         let info;
         try {
             info = await file.query_info_async('standard::type',
                 Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null);
         } catch (e) {
-            this.showError('Cannot access:\n' + path);
-            return;
+            if (!progress) this.showError('Cannot access:\n' + path);
+            return false;
         }
 
         if (info.get_file_type() === Gio.FileType.DIRECTORY) {
             let indexPath = GLib.build_filenamev([path, 'index.theme']);
             if (!Gio.File.new_for_path(indexPath).query_exists(null)) {
-                this.showError('Directory does not contain index.theme:\n' + path);
-                return;
+                if (!progress) this.showError('Directory does not contain index.theme:\n' + path);
+                return false;
             }
             path = indexPath;
         } else if (GLib.path_get_basename(path) !== 'index.theme') {
-            this.showError('Expected index.theme (or a directory containing one).\nGot:\n' + path);
-            return;
+            if (!progress) this.showError('Expected index.theme (or a directory containing one).\nGot:\n' + path);
+            return false;
         }
 
         for (let i = 0; i < this.themes.length; i++) {
             if (this.themes[i].indexPath === path) {
-                this.showError('Theme already loaded:\n' + path);
-                return;
+                if (!progress) this.showError('Theme already loaded:\n' + path);
+                return false;
             }
         }
 
         let theme = new IconTheme(path);
-        const ok = await theme.load();
+        const ok = await theme.load(progress);
+
+        if (progress && progress.isCancelled()) {
+            return false;
+        }
+
         if (!ok) {
             this.showError('Failed to load theme:\n' + (theme.error || 'unknown error'));
-            return;
+            return false;
         }
 
         this.themes.push(theme);
@@ -1729,6 +1859,7 @@ class MainApp {
         this.updateThemesBar();
         this.applyFilter();
         this.updateStatus();
+        return true;
     }
 
     onRemoveTheme() {
@@ -2057,6 +2188,11 @@ class MainApp {
         let infoText = '<b>' + escapeMarkup(name) + '</b>\n';
         infoText += 'Themes: ' + escapeMarkup(themeNames.join(', ')) + '\n';
         infoText += 'Files: ' + fileCount + ', Symlinks: ' + symlinkCount;
+
+        // Контексты, в которых встречается имя — уникальные, по алфавиту.
+        let contextsArr = Array.from(entry.contexts).filter(Boolean).sort();
+        let contextsStr = contextsArr.length ? contextsArr.join(', ') : '(none)';
+        infoText += '\nContext(s): ' + escapeMarkup(contextsStr);
 
         this.infoText.set_markup(infoText);
 
