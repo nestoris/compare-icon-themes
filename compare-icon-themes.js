@@ -9,6 +9,7 @@ const Gtk = imports.gi.Gtk;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const GObject = imports.gi.GObject;
+const Gdk = imports.gi.Gdk;
 const GdkPixbuf = imports.gi.GdkPixbuf;
 
 Gio._promisify(Gio.File.prototype, 'enumerate_children_async', 'enumerate_children_finish');
@@ -94,6 +95,222 @@ function resolveTargetPath(themeDir, dirName, target) {
         let base = GLib.build_filenamev([themeDir, dirName]);
         return GLib.canonicalize_filename(target, base);
     } catch (e) { return null; }
+}
+
+// =====================================================================
+// ПУТИ ПОИСКА ТЕМ И СПИСОК СИСТЕМНЫХ ТЕМ
+// =====================================================================
+
+function getIconSearchPaths() {
+    const paths = [];
+    paths.push(GLib.build_filenamev([GLib.get_home_dir(), '.icons']));
+    paths.push(GLib.build_filenamev([GLib.get_user_data_dir(), 'icons']));
+    for (const d of GLib.get_system_data_dirs()) {
+        paths.push(GLib.build_filenamev([d, 'icons']));
+    }
+    paths.push('/usr/share/pixmaps');
+    return paths;
+}
+
+function collectSystemThemeNames() {
+    const names = [];
+    const seen = new Set();
+    for (const baseDir of getIconSearchPaths()) {
+        const dir = Gio.File.new_for_path(baseDir);
+        let enumerator;
+        try {
+            enumerator = dir.enumerate_children(
+                'standard::name,standard::type',
+                Gio.FileQueryInfoFlags.NONE, null);
+        } catch (e) { continue; }
+        let info;
+        while ((info = enumerator.next_file(null)) !== null) {
+            if (info.get_file_type() !== Gio.FileType.DIRECTORY) continue;
+            const n = info.get_name();
+            if (seen.has(n)) continue;
+            const indexPath = GLib.build_filenamev([baseDir, n, 'index.theme']);
+            if (!Gio.File.new_for_path(indexPath).query_exists(null)) continue;
+            seen.add(n);
+            names.push(n);
+        }
+        enumerator.close(null);
+    }
+    names.sort();
+    return names;
+}
+
+// =====================================================================
+// НАСТРОЙКИ (сохраняются в ~/.config/compare-icon-themes/config.ini)
+// =====================================================================
+
+class Settings {
+    constructor() {
+        const configDir = GLib.build_filenamev([
+            GLib.get_user_config_dir(), 'compare-icon-themes']);
+        try { GLib.mkdir_with_parents(configDir, 0o755); } catch (e) {}
+        this.path = GLib.build_filenamev([configDir, 'config.ini']);
+
+        this.colors = {
+            missing:      '#CC0000',
+            symlinksOnly: '#800080',
+            hasSymlinks:  '#0000CC',
+            ok:           '#000000'
+        };
+        this.defaultTheme = '';
+        this.load();
+    }
+
+    load() {
+        try {
+            const kf = new GLib.KeyFile();
+            kf.load_from_file(this.path, GLib.KeyFileFlags.NONE);
+            try { this.colors.missing      = kf.get_string('colors', 'missing'); } catch (e) {}
+            try { this.colors.symlinksOnly = kf.get_string('colors', 'symlinks_only'); } catch (e) {}
+            try { this.colors.hasSymlinks  = kf.get_string('colors', 'has_symlinks'); } catch (e) {}
+            try { this.colors.ok           = kf.get_string('colors', 'ok'); } catch (e) {}
+            try { this.defaultTheme        = kf.get_string('preview', 'default_theme'); } catch (e) {}
+        } catch (e) {
+            // файла нет — используем значения по умолчанию
+        }
+    }
+
+    save() {
+        const kf = new GLib.KeyFile();
+        kf.set_string('colors', 'missing', this.colors.missing);
+        kf.set_string('colors', 'symlinks_only', this.colors.symlinksOnly);
+        kf.set_string('colors', 'has_symlinks', this.colors.hasSymlinks);
+        kf.set_string('colors', 'ok', this.colors.ok);
+        kf.set_string('preview', 'default_theme', this.defaultTheme);
+        try { kf.save_to_file(this.path); } catch (e) {}
+    }
+}
+
+// =====================================================================
+// ОКНО НАСТРОЕК
+// =====================================================================
+
+class SettingsDialog {
+    constructor(parent, settings, onSaved) {
+        this.settings = settings;
+        this.onSaved = onSaved;
+
+        this.dialog = new Gtk.Dialog({
+            title: 'Settings',
+            transient_for: parent,
+            modal: true,
+            default_width: 480
+        });
+        this.dialog.add_button('Cancel', Gtk.ResponseType.CANCEL);
+        this.dialog.add_button('Save', Gtk.ResponseType.OK);
+
+        this.buildUI();
+    }
+
+    buildUI() {
+        const content = this.dialog.get_content_area();
+        content.set_spacing(10);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+
+        const grid = new Gtk.Grid({ row_spacing: 8, column_spacing: 12 });
+
+        let row = 0;
+
+        const colorHdr = new Gtk.Label({
+            label: '<b>Status colors</b>',
+            use_markup: true,
+            halign: Gtk.Align.START
+        });
+        grid.attach(colorHdr, 0, row, 2, 1);
+        row++;
+
+        const colorRows = [
+            ['missing',      'Missing in some themes:'],
+            ['symlinksOnly', 'Symlinks only:'],
+            ['hasSymlinks',  'Has symlinks:'],
+            ['ok',           'OK:']
+        ];
+        this.colorButtons = {};
+        for (const [key, label] of colorRows) {
+            const lbl = new Gtk.Label({ label: label, halign: Gtk.Align.START });
+            const btn = new Gtk.ColorButton();
+            const rgba = new Gdk.RGBA();
+            if (rgba.parse(this.settings.colors[key] || '#000000')) {
+                btn.set_rgba(rgba);
+            }
+            this.colorButtons[key] = btn;
+            grid.attach(lbl, 0, row, 1, 1);
+            grid.attach(btn, 1, row, 1, 1);
+            row++;
+        }
+
+        const sep = new Gtk.Separator({ orientation: Gtk.Orientation.HORIZONTAL });
+        grid.attach(sep, 0, row, 2, 1);
+        row++;
+
+        const themeHdr = new Gtk.Label({
+            label: '<b>Preview theme</b>',
+            use_markup: true,
+            halign: Gtk.Align.START
+        });
+        grid.attach(themeHdr, 0, row, 2, 1);
+        row++;
+
+        const themeHint = new Gtk.Label({
+            label: 'Fallback icon theme for previews in the "Add system theme"\n' +
+                   'dialog. Leave empty to use the icon from the theme itself\n' +
+                   '(with fallback to the GTK default theme).',
+            halign: Gtk.Align.START,
+            xalign: 0,
+            wrap: true
+        });
+        grid.attach(themeHint, 0, row, 2, 1);
+        row++;
+
+        this.themeCombo = Gtk.ComboBoxText.new_with_entry();
+        const names = collectSystemThemeNames();
+        for (const n of names) this.themeCombo.append_text(n);
+
+        const entry = this.themeCombo.get_child();
+        if (entry) {
+            entry.set_width_chars(30);
+            if (this.settings.defaultTheme) entry.set_text(this.settings.defaultTheme);
+        }
+        grid.attach(this.themeCombo, 0, row, 2, 1);
+
+        content.pack_start(grid, true, true, 0);
+        this.dialog.show_all();
+    }
+
+    run() {
+        const response = this.dialog.run();
+
+        if (response === Gtk.ResponseType.OK) {
+            for (const key of Object.keys(this.colorButtons)) {
+                const rgba = this.colorButtons[key].get_rgba();
+                const r = Math.round(rgba.red * 255);
+                const g = Math.round(rgba.green * 255);
+                const b = Math.round(rgba.blue * 255);
+                this.settings.colors[key] = '#' +
+                    r.toString(16).padStart(2, '0') +
+                    g.toString(16).padStart(2, '0') +
+                    b.toString(16).padStart(2, '0');
+            }
+
+            let theme = '';
+            const entry = this.themeCombo.get_child();
+            if (entry) theme = entry.get_text();
+            if (!theme) theme = this.themeCombo.get_active_text() || '';
+            this.settings.defaultTheme = theme.trim();
+
+            this.settings.save();
+            if (this.onSaved) this.onSaved();
+        }
+
+        this.dialog.destroy();
+    }
 }
 
 // =====================================================================
@@ -326,14 +543,7 @@ class SystemThemesDialog {
     }
 
     scanSystemThemes() {
-        const searchDirs = [];
-        const home = GLib.get_home_dir();
-        searchDirs.push(GLib.build_filenamev([home, '.icons']));
-        searchDirs.push(GLib.build_filenamev([GLib.get_user_data_dir(), 'icons']));
-        for (const d of GLib.get_system_data_dirs()) {
-            searchDirs.push(GLib.build_filenamev([d, 'icons']));
-        }
-        searchDirs.push('/usr/share/pixmaps');
+        const searchDirs = getIconSearchPaths();
 
         const seen = new Set();
         const themes = [];
@@ -455,11 +665,7 @@ class SystemThemesDialog {
     findExampleIcon(themeInfo, exampleName) {
         if (!exampleName) exampleName = 'folder';
 
-        // 1. Пытаемся загрузить иконку через Gtk.IconTheme,
-        //    указав путь и имя конкретной темы.
-        //    Это корректно работает с SVG, симлинками, наследованием
-        //    (Inherits=), размерами и т.д. — то же самое, что делает
-        //    xfce4-appearance-settings.
+        // 1. Иконка из самой темы (или унаследованная ею).
         try {
             const it = Gtk.IconTheme.new();
             const parent = GLib.path_get_dirname(themeInfo.dir);
@@ -470,17 +676,34 @@ class SystemThemesDialog {
                 const pix = it.load_icon(exampleName, 48, 0);
                 if (pix) return pix;
             }
-
-            // Fallback 1: folder из той же темы (или унаследованный ею)
             if (exampleName !== 'folder' && it.has_icon('folder')) {
                 const pix = it.load_icon('folder', 48, 0);
                 if (pix) return pix;
             }
-        } catch (e) {
-            // если что-то не так с путём/именем — падаем дальше
+        } catch (e) {}
+
+        // 2. Иконка из темы по умолчанию, заданной в настройках.
+        const defTheme = (this.app && this.app.settings)
+            ? this.app.settings.defaultTheme
+            : '';
+        if (defTheme) {
+            try {
+                const it = Gtk.IconTheme.new();
+                for (const p of getIconSearchPaths()) it.append_search_path(p);
+                it.set_custom_theme(defTheme);
+
+                if (it.has_icon(exampleName)) {
+                    const pix = it.load_icon(exampleName, 48, 0);
+                    if (pix) return pix;
+                }
+                if (exampleName !== 'folder' && it.has_icon('folder')) {
+                    const pix = it.load_icon('folder', 48, 0);
+                    if (pix) return pix;
+                }
+            } catch (e) {}
         }
 
-        // 2. Последний резерв: folder из системной темы по умолчанию
+        // 3. Резерв: folder из системной темы GTK по умолчанию.
         try {
             const sys = Gtk.IconTheme.get_default();
             if (sys && sys.has_icon('folder')) {
@@ -960,6 +1183,8 @@ class MainApp {
         this.filteredNames = [];
         this.currentName = null;
         this.filterTimer = null;
+        this.viewMode = 'All';
+        this.settings = new Settings();
 
         this.buildUI();
     }
@@ -1010,6 +1235,19 @@ class MainApp {
         });
         this.filterEntry.connect('changed', () => this.onFilterChanged());
         toolbar.pack_start(this.filterEntry, false, false, 0);
+
+        // Кнопка настроек (шестерёнка) в правом верхнем углу панели.
+        this.settingsBtn = new Gtk.Button();
+        try {
+            this.settingsBtn.set_image(Gtk.Image.new_from_icon_name(
+                'preferences-system', Gtk.IconSize.BUTTON));
+        } catch (e) {
+            this.settingsBtn.set_label('\u2699'); // ⚙
+        }
+        this.settingsBtn.set_tooltip_text('Settings');
+        this.settingsBtn.set_relief(Gtk.ReliefStyle.NONE);
+        this.settingsBtn.connect('clicked', () => this.onSettings());
+        toolbar.pack_end(this.settingsBtn, false, false, 0);
 
         mainBox.pack_start(toolbar, false, false, 0);
 
@@ -1189,12 +1427,58 @@ class MainApp {
         mainBox.pack_start(split, true, true, 0);
 
         this.statusBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 5 });
-        this.statusLabel = new Gtk.Label({
-            label: '',
+
+        // Первичный фильтр по характеру записей (файлы / симлинки / смесь).
+        let viewLbl = new Gtk.Label({
+            label: 'Show:',
             halign: Gtk.Align.START,
             margin_start: 4
         });
+        this.statusBox.pack_start(viewLbl, false, false, 0);
+
+        this.viewModeCombo = new Gtk.ComboBoxText();
+        this.viewModeCombo.append_text('All');
+        this.viewModeCombo.append_text('Originals');
+        this.viewModeCombo.append_text('Originals (strict)');
+        this.viewModeCombo.append_text('Mixed');
+        this.viewModeCombo.append_text('Mixed (strict)');
+        this.viewModeCombo.append_text('Symlinks only');
+        this.viewModeCombo.set_active(0);
+        this.viewModeCombo.set_tooltip_text(
+            'Pre-filter icon names before applying the text filter.\n' +
+            '\n' +
+            'All — show every icon name.\n' +
+            '\n' +
+            'Originals — name is a regular file (not a symlink)\n' +
+            'in at least one theme.\n' +
+            '\n' +
+            'Originals (strict) — name is a regular file in every\n' +
+            'theme where it appears; no symlinks at all.\n' +
+            '\n' +
+            'Mixed — name appears both as file and as symlink\n' +
+            'somewhere, but no theme has it as files only.\n' +
+            '\n' +
+            'Mixed (strict) — every theme that contains the name\n' +
+            'has a mix of files and symlinks; no theme has it as\n' +
+            'files only or as symlinks only. Useful to spot themes\n' +
+            'that are not fully converted.\n' +
+            '\n' +
+            'Symlinks only — name is a symlink in every theme\n' +
+            'where it appears; no regular files at all.'
+        );
+        this.viewModeCombo.connect('changed', () => {
+            this.viewMode = this.viewModeCombo.get_active_text() || 'All';
+            this.applyFilter();
+        });
+        this.statusBox.pack_start(this.viewModeCombo, false, false, 0);
+
+        this.statusLabel = new Gtk.Label({
+            label: '',
+            halign: Gtk.Align.START,
+            margin_start: 8
+        });
         this.statusBox.pack_start(this.statusLabel, false, false, 0);
+
         mainBox.pack_start(this.statusBox, false, false, 0);
 
         this.window.add(mainBox);
@@ -1407,6 +1691,14 @@ class MainApp {
         this.updateStatus();
     }
 
+    onSettings() {
+        const dlg = new SettingsDialog(this.window, this.settings, () => {
+            // Настройки изменились — обновляем цвета в списке значков.
+            this.updateListDisplay();
+        });
+        dlg.run();
+    }
+
     rebuildIndex() {
         this.iconIndex.clear();
 
@@ -1446,16 +1738,111 @@ class MainApp {
 
     applyFilter() {
         let text = this.filterEntry.get_text().toLowerCase();
+        const mode = this.viewMode || 'All';
 
         this.filteredNames = [];
         for (let [name, entry] of this.iconIndex) {
-            if (text === '' || name.toLowerCase().indexOf(text) >= 0) {
-                this.filteredNames.push(name);
-            }
+            // 1. Первичный фильтр по типу записей.
+            if (mode !== 'All' && !this.matchesViewMode(entry, mode)) continue;
+            // 2. Текстовый фильтр по имени.
+            if (text !== '' && name.toLowerCase().indexOf(text) < 0) continue;
+            this.filteredNames.push(name);
         }
         this.filteredNames.sort();
 
         this.updateListDisplay();
+    }
+
+    // Классифицирует записи значка по темам:
+    //   - anyFileOnly     — есть хотя бы одна тема, где значок только файлами;
+    //   - allFileOnly     — во всех темах, где значок есть, он только файлами;
+    //   - anySymlinkOnly  — есть хотя бы одна тема, где значок только симлинками;
+    //   - allSymlinkOnly  — во всех темах, где значок есть, он только симлинками;
+    //   - hasFileOverall / hasSymlinkOverall — есть ли в принципе файлы/симлинки.
+    classifyEntry(entry) {
+        const perTheme = new Map();
+        let hasFileOverall = false;
+        let hasSymlinkOverall = false;
+
+        for (let i = 0; i < entry.occurrences.length; i++) {
+            const occ = entry.occurrences[i];
+            let c = perTheme.get(occ.theme);
+            if (!c) {
+                c = { hasFile: false, hasSymlink: false };
+                perTheme.set(occ.theme, c);
+            }
+            if (occ.isSymlink) {
+                c.hasSymlink = true;
+                hasSymlinkOverall = true;
+            } else {
+                c.hasFile = true;
+                hasFileOverall = true;
+            }
+        }
+
+        let anyFileOnly = false;
+        let anySymlinkOnly = false;
+        let allFileOnly = perTheme.size > 0;
+        let allSymlinkOnly = perTheme.size > 0;
+
+        for (const c of perTheme.values()) {
+            if (c.hasFile && c.hasSymlink) {
+                allFileOnly = false;
+                allSymlinkOnly = false;
+            } else if (c.hasFile) {
+                anyFileOnly = true;
+                allSymlinkOnly = false;
+            } else {
+                anySymlinkOnly = true;
+                allFileOnly = false;
+            }
+        }
+
+        return {
+            hasFileOverall: hasFileOverall,
+            hasSymlinkOverall: hasSymlinkOverall,
+            anyFileOnly: anyFileOnly,
+            anySymlinkOnly: anySymlinkOnly,
+            allFileOnly: allFileOnly,
+            allSymlinkOnly: allSymlinkOnly
+        };
+    }
+
+    matchesViewMode(entry, mode) {
+        const info = this.classifyEntry(entry);
+        switch (mode) {
+            case 'Originals':
+                // Имя файлами-не-симлинками хотя бы в одной теме.
+                return info.anyFileOnly;
+
+            case 'Originals (strict)':
+                // Во всех темах, где имя есть, оно представлено только файлами.
+                return info.allFileOnly;
+
+            case 'Mixed':
+                // Есть и файлы, и симлинки, но ни в одной теме
+                // оно не представлено только файлами.
+                return info.hasFileOverall
+                    && info.hasSymlinkOverall
+                    && !info.anyFileOnly;
+
+            case 'Mixed (strict)':
+                // Ни в одной теме оно не представлено ни только файлами,
+                // ни только симлинками. То есть каждая тема, где оно есть,
+                // содержит его как смесь.
+                return info.hasFileOverall
+                    && info.hasSymlinkOverall
+                    && !info.anyFileOnly
+                    && !info.anySymlinkOnly;
+
+            case 'Symlinks only':
+                // Во всех темах, где имя есть, оно представлено только симлинками.
+                return info.allSymlinkOnly;
+
+            case 'All':
+            default:
+                return true;
+        }
     }
 
     updateListDisplay() {
@@ -1481,16 +1868,16 @@ class MainApp {
 
             let status, color;
             if (entry.themes.size < totalThemes) {
-                color = 'red';
+                color = this.settings.colors.missing;
                 status = 'Missing in ' + (totalThemes - entry.themes.size);
             } else if (symlinkCount === entry.occurrences.length) {
-                color = 'purple';
+                color = this.settings.colors.symlinksOnly;
                 status = 'Symlinks only';
             } else if (symlinkCount > 0) {
-                color = 'blue';
+                color = this.settings.colors.hasSymlinks;
                 status = 'Has symlinks';
             } else {
-                color = 'black';
+                color = this.settings.colors.ok;
                 status = 'OK';
             }
 
