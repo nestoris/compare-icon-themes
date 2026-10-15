@@ -26,3 +26,7 @@ cjs compare-icon-themes.js
 **System themes adding**
 
 ![add-system-theme](add-system-theme.png)
+
+**Color settings dialog**
+
+![color-settings](color-settings.png)
