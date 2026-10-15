@@ -19,6 +19,10 @@ cjs compare-icon-themes.js
 
 ![visual-comparison](visual-comparison.png)
 
+**Visual comparison in window**
+
+![comparison-in-window](comparison-in-window.png)
+
 **Browsing theme directories**
 
 ![browse-theme](browse-theme.png)

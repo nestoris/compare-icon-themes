@@ -1221,6 +1221,13 @@ class MainApp {
         this.viewMode = 'All';
         this.settings = new Settings();
 
+        // Состояние визуальной вкладки в правой панели.
+        this.visualPreviewSize = 48;
+        this.visualThemeCount = -1;
+        this.visualOccurrences = [];
+        this.visualRows = [];
+        this.visualRowMap = new Map();
+
         this.buildUI();
     }
 
@@ -1373,6 +1380,7 @@ class MainApp {
 
         split.pack_start(leftBox, true, true, 0);
 
+        // Правая панель
         let rightBox = new Gtk.Box({
             orientation: Gtk.Orientation.VERTICAL,
             spacing: 5,
@@ -1386,6 +1394,7 @@ class MainApp {
         });
         rightBox.pack_start(infoHdr, false, false, 0);
 
+        // Шапка над ноутбуком: превью, имя, сводка по темам.
         let infoTop = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 5 });
         this.infoImage = new Gtk.Image();
         this.infoImage.set_size_request(64, 64);
@@ -1401,6 +1410,17 @@ class MainApp {
         });
         infoTop.pack_start(this.infoText, true, true, 0);
         rightBox.pack_start(infoTop, false, false, 0);
+
+        // ----- Notebook с двумя вкладками -----
+        this.rightNotebook = new Gtk.Notebook();
+        this.rightNotebook.set_scrollable(true);
+
+        // --- Вкладка 1: список файлов/симлинков ---
+        let filesTab = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 5,
+            margin: 4
+        });
 
         this.infoStore = new Gtk.ListStore();
         this.infoStore.set_column_types([
@@ -1448,14 +1468,80 @@ class MainApp {
         let infoScroll = new Gtk.ScrolledWindow();
         infoScroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC);
         infoScroll.add(this.infoView);
-        rightBox.pack_start(infoScroll, true, true, 0);
+        filesTab.pack_start(infoScroll, true, true, 0);
 
         let hint = new Gtk.Label({
             label: '<i>Double-click an icon to open the comparison window</i>',
             use_markup: true,
             halign: Gtk.Align.START
         });
-        rightBox.pack_start(hint, false, false, 0);
+        filesTab.pack_start(hint, false, false, 0);
+
+        this.rightNotebook.append_page(filesTab, new Gtk.Label({ label: 'Files' }));
+
+        // --- Вкладка 2: визуальное сравнение (как в GraphicalComparisonWindow) ---
+        let visualTab = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 5,
+            margin: 4
+        });
+
+        this.visualStore = new Gtk.ListStore();
+        this.visualView = new Gtk.TreeView({
+            model: this.visualStore,
+            headers_clickable: true
+        });
+
+        let visualScroll = new Gtk.ScrolledWindow();
+        visualScroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC);
+        visualScroll.add(this.visualView);
+        visualTab.pack_start(visualScroll, true, true, 0);
+
+        // Нижняя строка визуальной вкладки: "Preview size:" + combo.
+        let visualBottom = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6
+        });
+
+        this.visualSizeLabel = new Gtk.Label({
+            label: 'Preview size:',
+            halign: Gtk.Align.START
+        });
+        visualBottom.pack_start(this.visualSizeLabel, false, false, 0);
+
+        this.visualSizeCombo = Gtk.ComboBoxText.new_with_entry();
+        let vEntry = this.visualSizeCombo.get_child();
+        if (vEntry) {
+            vEntry.set_width_chars(5);
+            vEntry.set_max_length(6);
+        }
+        this.visualSizeCombo.set_tooltip_text(
+            'Size of the icons shown in the table (select or type a number)');
+        this.visualSizeCombo.connect('changed', () => {
+            let t = null;
+            const e = this.visualSizeCombo.get_child();
+            if (e) t = e.get_text();
+            if (!t) t = this.visualSizeCombo.get_active_text();
+            if (!t) return;
+            const v = parseInt(t, 10);
+            if (!isNaN(v) && v > 0 && v <= 1024 && v !== this.visualPreviewSize) {
+                this.visualPreviewSize = v;
+                this.fillVisualStore();
+            }
+        });
+        visualBottom.pack_start(this.visualSizeCombo, false, false, 0);
+        visualBottom.pack_start(new Gtk.Label({ label: '' }), true, true, 0);
+
+        visualTab.pack_start(visualBottom, false, false, 0);
+
+        this.rightNotebook.append_page(visualTab, new Gtk.Label({ label: 'Visual' }));
+
+        // При переключении вкладки — обновляем содержимое видимой.
+        this.rightNotebook.connect('switch-page', (nb, page, pageNum) => {
+            this.refreshRightTabs(pageNum);
+        });
+
+        rightBox.pack_start(this.rightNotebook, true, true, 0);
 
         split.pack_start(rightBox, false, false, 0);
 
@@ -1757,6 +1843,9 @@ class MainApp {
                 }
             }
         }
+        // Темы могли измениться — на следующем обновлении визуальной
+        // вкладки колонки будут пересозданы.
+        this.visualThemeCount = -1;
     }
 
     onFilterChanged() {
@@ -1938,8 +2027,7 @@ class MainApp {
         let entry = this.iconIndex.get(name);
         if (!entry) return;
 
-        this.infoStore.clear();
-
+        // ----- Верхняя часть: превью + имя + сводка -----
         let previewPixbuf = null;
         for (let i = 0; i < entry.occurrences.length; i++) {
             let occ = entry.occurrences[i];
@@ -1972,6 +2060,22 @@ class MainApp {
 
         this.infoText.set_markup(infoText);
 
+        // ----- Обновляем активную вкладку -----
+        const pageNum = this.rightNotebook.get_current_page();
+        if (pageNum === 0) {
+            this.populateInfoStore(name);
+        } else if (pageNum === 1) {
+            this.refreshVisualTab();
+        }
+    }
+
+    // Заполнение первой вкладки (список файлов/симлинков).
+    populateInfoStore(name) {
+        let entry = this.iconIndex.get(name);
+        if (!entry) return;
+
+        this.infoStore.clear();
+
         for (let i = 0; i < entry.occurrences.length; i++) {
             let occ = entry.occurrences[i];
             let sizeText = occ.size != null ? String(occ.size) : '';
@@ -2001,6 +2105,192 @@ class MainApp {
             }
             return false;
         });
+    }
+
+    // Пересборка колонок визуальной вкладки при изменении набора тем.
+    ensureVisualColumns() {
+        const themesCount = this.themes.length;
+        if (this.visualThemeCount === themesCount) return;
+
+        // Пересоздаём модель: количество колонок зависит от числа тем.
+        let colTypes = [GObject.TYPE_STRING, GObject.TYPE_INT];
+        for (let i = 0; i < themesCount; i++) {
+            colTypes.push(GdkPixbuf.Pixbuf);
+            colTypes.push(GObject.TYPE_STRING);
+            colTypes.push(GObject.TYPE_STRING);
+        }
+        this.visualStore = new Gtk.ListStore();
+        this.visualStore.set_column_types(colTypes);
+        this.visualView.set_model(this.visualStore);
+
+        // Убираем старые колонки.
+        const oldCols = this.visualView.get_columns();
+        for (let i = 0; i < oldCols.length; i++) {
+            this.visualView.remove_column(oldCols[i]);
+        }
+
+        // Колонка "Size".
+        let sizeR = new Gtk.CellRendererText();
+        sizeR.set_property('xpad', 4);
+        let sizeC = new Gtk.TreeViewColumn({ title: 'Size' });
+        sizeC.pack_start(sizeR, true);
+        sizeC.add_attribute(sizeR, 'text', 0);
+        sizeC.set_min_width(46);
+        sizeC.set_resizable(true);
+        sizeC.set_sort_column_id(1);
+        sizeC.set_clickable(true);
+        this.visualView.append_column(sizeC);
+
+        // Колонка на каждую тему.
+        for (let ti = 0; ti < themesCount; ti++) {
+            let pixIdx = 2 + ti * 3;
+            let bgIdx  = 3 + ti * 3;
+
+            let r = new Gtk.CellRendererPixbuf();
+            r.set_property('xpad', 3);
+            r.set_property('ypad', 2);
+
+            let title = this.themes[ti].name;
+            if (title.length > 14) title = title.substring(0, 13) + '…';
+
+            let c = new Gtk.TreeViewColumn({ title: title });
+            c.pack_start(r, false);
+            c.add_attribute(r, 'pixbuf', pixIdx);
+            c.add_attribute(r, 'cell-background', bgIdx);
+            c.set_min_width(50);
+            c.set_resizable(true);
+            this.visualView.append_column(c);
+        }
+
+        this.visualStore.set_sort_column_id(1, Gtk.SortType.ASCENDING);
+        this.visualThemeCount = themesCount;
+    }
+
+    // Полное обновление визуальной вкладки (строки, комбо размера, модель).
+    refreshVisualTab() {
+        this.ensureVisualColumns();
+
+        const name = this.currentName;
+        const entry = name ? this.iconIndex.get(name) : null;
+        const occurrences = entry ? entry.occurrences : [];
+        this.visualOccurrences = occurrences;
+
+        // Уникальные размеры (строки таблицы).
+        const rowMap = new Map();
+        for (const occ of occurrences) {
+            const key = this.rowKeyOf(occ);
+            if (!rowMap.has(key)) rowMap.set(key, this.rowSortKeyOf(occ));
+        }
+        const rows = Array.from(rowMap.keys()).sort((a, b) => {
+            const ka = rowMap.get(a);
+            const kb = rowMap.get(b);
+            if (ka !== kb) return ka - kb;
+            return a.localeCompare(b);
+        });
+        this.visualRows = rows;
+        this.visualRowMap = rowMap;
+
+        // Обновляем ComboBoxText доступными размерами.
+        const sizes = this.collectSizes(occurrences);
+        if (sizes.length === 0) sizes.push(48);
+
+        // Сохраняем текущий выбор, если он ещё доступен.
+        if (sizes.indexOf(this.visualPreviewSize) < 0) {
+            this.visualPreviewSize = this.pickDefaultSize(sizes);
+        }
+
+        this.visualSizeCombo.remove_all();
+        for (const s of sizes) this.visualSizeCombo.append_text(String(s));
+        const activeIdx = sizes.indexOf(this.visualPreviewSize);
+        if (activeIdx >= 0) {
+            this.visualSizeCombo.set_active(activeIdx);
+        }
+
+        this.fillVisualStore();
+    }
+
+    // Заполнение модели визуальной вкладки текущими данными.
+    fillVisualStore() {
+        if (!this.visualStore) return;
+        this.visualStore.clear();
+
+        const occurrences = this.visualOccurrences || [];
+        const rows = this.visualRows || [];
+        const size = this.visualPreviewSize;
+        const themes = this.themes;
+        const self = this;
+
+        for (let ri = 0; ri < rows.length; ri++) {
+            const sz = rows[ri];
+            const rowData = [sz, this.visualRowMap.get(sz)];
+
+            for (let ti = 0; ti < themes.length; ti++) {
+                const theme = themes[ti];
+                let match = null;
+
+                for (let oi = 0; oi < occurrences.length; oi++) {
+                    const occ = occurrences[oi];
+                    if (occ.theme !== theme) continue;
+                    if (self.rowKeyOf(occ) !== sz) continue;
+                    match = occ;
+                    break;
+                }
+
+                if (match) {
+                    const pix = pixbufFromFile(match.fullPath, size);
+                    const bg = match.isSymlink ? '#D9E6F2' : '#FFFFFF';
+                    rowData.push(pix || getTransparentPixbuf());
+                    rowData.push(bg);
+                    rowData.push(match.isSymlink ? 'symlink' : 'file');
+                } else {
+                    rowData.push(getTransparentPixbuf());
+                    rowData.push('#F0F0F0');
+                    rowData.push('');
+                }
+            }
+
+            const iter = this.visualStore.append();
+            const idx = [];
+            for (let k = 0; k < rowData.length; k++) idx.push(k);
+            this.visualStore.set(iter, idx, rowData);
+        }
+    }
+
+    // Переключение вкладок: обновляем ту, что показана.
+    refreshRightTabs(pageNum) {
+        if (!this.currentName) return;
+        if (pageNum === 0) {
+            this.populateInfoStore(this.currentName);
+        } else if (pageNum === 1) {
+            this.refreshVisualTab();
+        }
+    }
+
+    // Утилиты, повторяющие логику GraphicalComparisonWindow.
+    rowKeyOf(occ) {
+        if (occ.size != null) return String(occ.size);
+        if (occ.type) return occ.type;
+        return '?';
+    }
+
+    rowSortKeyOf(occ) {
+        if (occ.size != null) return occ.size;
+        return 999999;
+    }
+
+    collectSizes(occurrences) {
+        const set = new Set();
+        for (const occ of occurrences) {
+            if (occ.size != null) set.add(occ.size);
+        }
+        return Array.from(set).sort((a, b) => a - b);
+    }
+
+    pickDefaultSize(sizes) {
+        if (sizes.length === 0) return 48;
+        if (sizes.indexOf(48) >= 0) return 48;
+        for (const s of sizes) if (s >= 48) return s;
+        return sizes[sizes.length - 1];
     }
 
     onInfoRowSelected() {
