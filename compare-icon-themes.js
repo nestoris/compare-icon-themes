@@ -12,10 +12,11 @@ const GObject = imports.gi.GObject;
 const Gdk = imports.gi.Gdk;
 const GdkPixbuf = imports.gi.GdkPixbuf;
 
-Gio._promisify(Gio.File.prototype, 'enumerate_children_async', 'enumerate_children_finish');
-Gio._promisify(Gio.FileEnumerator.prototype, 'next_files_async', 'next_files_finish');
-Gio._promisify(Gio.File.prototype, 'query_info_async', 'query_info_finish');
+Gio._promisify(Gio.File.prototype, 'enumerate_children_async');
+Gio._promisify(Gio.FileEnumerator.prototype, 'next_files_async');
+Gio._promisify(Gio.File.prototype, 'query_info_async');
 Gio._promisify(Gio.File.prototype, 'load_contents_async', 'load_contents_finish');
+Gio._promisify(Gio.File.prototype, 'replace_contents_async', 'replace_contents_finish');
 
 Gtk.init(null);
 
@@ -97,6 +98,57 @@ function resolveTargetPath(themeDir, dirName, target) {
     } catch (e) { return null; }
 }
 
+// Открыть путь (файл или папку) приложением по умолчанию.
+function openPathWithDefault(path) {
+    try {
+        const uri = Gio.File.new_for_path(path).get_uri();
+        Gio.AppInfo.launch_default_for_uri(uri, null);
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Запуск команды редактора темы. Поддерживаются подстановки:
+//   %d — каталог темы
+//   %f — путь к index.theme
+//   %n — имя каталога темы
+// Если в команде нет ни одной из них, каталог темы добавляется
+// в конец как отдельный аргумент.
+function launchEditorCommand(cmd, themeDir, indexPath) {
+    if (!cmd || !cmd.trim()) return false;
+
+    const themeName = GLib.path_get_basename(themeDir);
+    let s = cmd;
+    let hasPlaceholder = false;
+
+    if (s.indexOf('%d') >= 0) {
+        s = s.split('%d').join(themeDir);
+        hasPlaceholder = true;
+    }
+    if (s.indexOf('%f') >= 0) {
+        s = s.split('%f').join(indexPath);
+        hasPlaceholder = true;
+    }
+    if (s.indexOf('%n') >= 0) {
+        s = s.split('%n').join(themeName);
+        hasPlaceholder = true;
+    }
+    if (!hasPlaceholder) {
+        const q = "'" + themeDir.replace(/'/g, "'\\''") + "'";
+        s = s + ' ' + q;
+    }
+
+    try {
+        const [ok, argv] = GLib.shell_parse_argv(s);
+        if (!ok || !argv || !argv.length) return false;
+        Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
 // =====================================================================
 // ПУТИ ПОИСКА ТЕМ И СПИСОК СИСТЕМНЫХ ТЕМ
 // =====================================================================
@@ -157,6 +209,17 @@ class Settings {
             ok:           '#000000'
         };
         this.defaultTheme = '';
+        this.editorCommand = '';
+        this.rememberSession = false;
+
+        // Кэш по умолчанию — в $XDG_CACHE_HOME/compare-icon-themes/icons
+        // (обычно ~/.cache/compare-icon-themes/icons).
+        this.cacheDir = GLib.build_filenamev([
+            GLib.get_user_cache_dir(), 'compare-icon-themes', 'icons']);
+
+        // Список путей index.theme из последней сессии.
+        this.sessionThemes = [];
+
         this.load();
     }
 
@@ -164,11 +227,33 @@ class Settings {
         try {
             const kf = new GLib.KeyFile();
             kf.load_from_file(this.path, GLib.KeyFileFlags.NONE);
+
             try { this.colors.missing      = kf.get_string('colors', 'missing'); } catch (e) {}
             try { this.colors.symlinksOnly = kf.get_string('colors', 'symlinks_only'); } catch (e) {}
             try { this.colors.hasSymlinks  = kf.get_string('colors', 'has_symlinks'); } catch (e) {}
             try { this.colors.ok           = kf.get_string('colors', 'ok'); } catch (e) {}
-            try { this.defaultTheme        = kf.get_string('preview', 'default_theme'); } catch (e) {}
+
+            try { this.defaultTheme = kf.get_string('preview', 'default_theme') || ''; } catch (e) {}
+
+            try { this.editorCommand   = kf.get_string('editor', 'command') || ''; } catch (e) {}
+            try { this.rememberSession = kf.get_boolean('editor', 'remember_session'); } catch (e) {}
+
+            try {
+                const cd = kf.get_string('cache', 'directory');
+                if (cd) this.cacheDir = cd;
+            } catch (e) {}
+
+            this.sessionThemes = [];
+            try {
+                const countStr = kf.get_string('session', 'count') || '0';
+                const count = parseInt(countStr, 10) || 0;
+                for (let i = 0; i < count; i++) {
+                    try {
+                        const v = kf.get_string('session', 'theme_' + i);
+                        if (v) this.sessionThemes.push(v);
+                    } catch (e) { break; }
+                }
+            } catch (e) {}
         } catch (e) {
             // файла нет — используем значения по умолчанию
         }
@@ -180,7 +265,20 @@ class Settings {
         kf.set_string('colors', 'symlinks_only', this.colors.symlinksOnly);
         kf.set_string('colors', 'has_symlinks', this.colors.hasSymlinks);
         kf.set_string('colors', 'ok', this.colors.ok);
+
         kf.set_string('preview', 'default_theme', this.defaultTheme);
+
+        kf.set_string('editor', 'command', this.editorCommand || '');
+        kf.set_boolean('editor', 'remember_session', !!this.rememberSession);
+
+        kf.set_string('cache', 'directory', this.cacheDir || '');
+
+        const n = (this.sessionThemes || []).length;
+        kf.set_string('session', 'count', String(n));
+        for (let i = 0; i < n; i++) {
+            kf.set_string('session', 'theme_' + i, this.sessionThemes[i]);
+        }
+
         try { kf.save_to_file(this.path); } catch (e) {}
     }
 }
@@ -279,6 +377,108 @@ class SettingsDialog {
             if (this.settings.defaultTheme) entry.set_text(this.settings.defaultTheme);
         }
         grid.attach(this.themeCombo, 0, row, 2, 1);
+        row++;
+
+        // --- Theme editor ---
+        const sep2 = new Gtk.Separator({ orientation: Gtk.Orientation.HORIZONTAL });
+        grid.attach(sep2, 0, row, 2, 1);
+        row++;
+
+        grid.attach(new Gtk.Label({
+            label: '<b>Theme editor</b>',
+            use_markup: true, halign: Gtk.Align.START
+        }), 0, row, 2, 1);
+        row++;
+
+        const editorHint = new Gtk.Label({
+            label: 'Command used for "Open in Theme Editor".\n' +
+                   'Placeholders: %d = theme directory, %f = index.theme,\n' +
+                   '%n = theme name. If none given, the theme directory is\n' +
+                   'appended as the last argument.',
+            halign: Gtk.Align.START, xalign: 0, wrap: true
+        });
+        grid.attach(editorHint, 0, row, 2, 1);
+        row++;
+
+        const editorBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 6 });
+        this.editorEntry = new Gtk.Entry();
+        this.editorEntry.set_text(this.settings.editorCommand || '');
+        this.editorEntry.set_hexpand(true);
+        this.editorEntry.set_placeholder_text('e.g. xfce4-appearance-settings');
+        this.editorEntry.set_tooltip_text('Command to launch the theme editor');
+        editorBox.pack_start(this.editorEntry, true, true, 0);
+
+        const editorBrowse = new Gtk.Button({ label: 'Browse…' });
+        editorBrowse.set_tooltip_text('Select an executable file');
+        editorBrowse.connect('clicked', () => {
+            const fc = new Gtk.FileChooserDialog({
+                title: 'Select theme editor executable',
+                action: Gtk.FileChooserAction.OPEN,
+                transient_for: this.dialog, modal: true
+            });
+            fc.add_button('Cancel', Gtk.ResponseType.CANCEL);
+            fc.add_button('Select', Gtk.ResponseType.OK);
+            const resp = fc.run();
+            const f = (resp === Gtk.ResponseType.OK) ? fc.get_filename() : null;
+            fc.destroy();
+            if (f) this.editorEntry.set_text(f);
+        });
+        editorBox.pack_start(editorBrowse, false, false, 0);
+        grid.attach(editorBox, 0, row, 2, 1);
+        row++;
+
+        this.rememberCheck = new Gtk.CheckButton({
+            label: 'Remember open themes and restore them on next start'
+        });
+        this.rememberCheck.set_active(!!this.settings.rememberSession);
+        this.rememberCheck.set_tooltip_text(
+            'Automatically re-open the themes that were loaded when you quit');
+        grid.attach(this.rememberCheck, 0, row, 2, 1);
+        row++;
+
+        // --- Cache ---
+        const sep3 = new Gtk.Separator({ orientation: Gtk.Orientation.HORIZONTAL });
+        grid.attach(sep3, 0, row, 2, 1);
+        row++;
+
+        grid.attach(new Gtk.Label({
+            label: '<b>Theme cache</b>',
+            use_markup: true, halign: Gtk.Align.START
+        }), 0, row, 2, 1);
+        row++;
+
+        const cacheHint = new Gtk.Label({
+            label: 'Scanned theme data is stored here to speed up the\n' +
+                   'loading of large themes on the next run.',
+            halign: Gtk.Align.START, xalign: 0, wrap: true
+        });
+        grid.attach(cacheHint, 0, row, 2, 1);
+        row++;
+
+        const cacheBox = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 6 });
+        this.cacheEntry = new Gtk.Entry();
+        this.cacheEntry.set_text(this.settings.cacheDir || '');
+        this.cacheEntry.set_hexpand(true);
+        this.cacheEntry.set_tooltip_text('Directory for cached theme scans');
+        cacheBox.pack_start(this.cacheEntry, true, true, 0);
+
+        const cacheBrowse = new Gtk.Button({ label: 'Browse…' });
+        cacheBrowse.set_tooltip_text('Select the cache directory');
+        cacheBrowse.connect('clicked', () => {
+            const fc = new Gtk.FileChooserDialog({
+                title: 'Select cache directory',
+                action: Gtk.FileChooserAction.SELECT_FOLDER,
+                transient_for: this.dialog, modal: true
+            });
+            fc.add_button('Cancel', Gtk.ResponseType.CANCEL);
+            fc.add_button('Select', Gtk.ResponseType.OK);
+            const resp = fc.run();
+            const f = (resp === Gtk.ResponseType.OK) ? fc.get_filename() : null;
+            fc.destroy();
+            if (f) this.cacheEntry.set_text(f);
+        });
+        cacheBox.pack_start(cacheBrowse, false, false, 0);
+        grid.attach(cacheBox, 0, row, 2, 1);
 
         content.pack_start(grid, true, true, 0);
         this.dialog.show_all();
@@ -304,6 +504,10 @@ class SettingsDialog {
             if (entry) theme = entry.get_text();
             if (!theme) theme = this.themeCombo.get_active_text() || '';
             this.settings.defaultTheme = theme.trim();
+            this.settings.editorCommand = this.editorEntry.get_text().trim();
+            this.settings.rememberSession = this.rememberCheck.get_active();
+            const newCache = this.cacheEntry.get_text().trim();
+            if (newCache) this.settings.cacheDir = newCache;
 
             this.settings.save();
             if (this.onSaved) this.onSaved();
@@ -329,11 +533,20 @@ class IconTheme {
         this.icons = new Map();
         this.error = null;
         this._loaded = false;
+        this.cacheDir = '';
     }
 
-    async load(progress) {
+    async load(progress, forceReload) {
         if (this._loaded) return true;
         try {
+            if (!forceReload && this.cacheDir) {
+                const cached = await this.tryLoadFromCache();
+                if (cached) {
+                    this._loaded = true;
+                    return true;
+                }
+            }
+
             const keyFile = new GLib.KeyFile();
             keyFile.load_from_file(this.indexPath, GLib.KeyFileFlags.NONE);
 
@@ -361,6 +574,12 @@ class IconTheme {
             }
 
             await this.scanIconsAsync(progress);
+
+            // Сохраняем результат в кэш (асинхронно, не блокируя UI).
+            if (this.cacheDir) {
+                this.saveToCache().catch(() => {});
+            }
+
             this._loaded = true;
             return true;
         } catch (e) {
@@ -466,6 +685,128 @@ class IconTheme {
         }
 
         if (progress) progress.setStatus(1.0, 'Done');
+    }
+
+    // Путь к файлу кэша. Ключ — MD5(индексный путь + mtime index.theme).
+    _cachePathSync() {
+        if (!this.cacheDir) return null;
+        try { GLib.mkdir_with_parents(this.cacheDir, 0o755); } catch (e) {}
+
+        let mtime = 0;
+        try {
+            const info = Gio.File.new_for_path(this.indexPath).query_info(
+                'time::modified', Gio.FileQueryInfoFlags.NONE, null);
+            mtime = info.get_attribute_uint64('time::modified');
+        } catch (e) {
+            return null;
+        }
+
+        const seed = this.indexPath + ':' + mtime;
+        let key;
+        try {
+            key = GLib.compute_checksum_for_string(
+                GLib.ChecksumType.MD5, seed, seed.length);
+        } catch (e) {
+            key = String(mtime);
+        }
+        return GLib.build_filenamev([this.cacheDir, key + '.json']);
+    }
+
+    async tryLoadFromCache() {
+        const cachePath = this._cachePathSync();
+        if (!cachePath) return false;
+
+        const file = Gio.File.new_for_path(cachePath);
+        if (!file.query_exists(null)) return false;
+
+        try {
+            const [contents] = await file.load_contents_async(null);
+            const text = decodeContents(contents);
+            const data = JSON.parse(text);
+
+            if (!data || data.version !== 1) return false;
+            if (data.indexPath !== this.indexPath) return false;
+
+            this.name = data.name || this.name;
+            this.comment = data.comment || '';
+            this.example = data.example || '';
+            this.directoryList = data.directoryList || [];
+
+            this.directories = new Map();
+            if (data.directories) {
+                for (const entry of data.directories) {
+                    this.directories.set(entry[0], entry[1]);
+                }
+            }
+
+            this.icons = new Map();
+            if (data.icons) {
+                for (const entry of data.icons) {
+                    const baseName = entry[0];
+                    const list = [];
+                    for (const o of entry[1]) {
+                        list.push({
+                            theme: this,
+                            dirName: o.dirName,
+                            fileName: o.fileName,
+                            fullPath: o.fullPath,
+                            relPath: o.relPath,
+                            size: o.size,
+                            context: o.context,
+                            type: o.type,
+                            isSymlink: o.isSymlink,
+                            target: o.target,
+                            resolvedTarget: o.resolvedTarget
+                        });
+                    }
+                    this.icons.set(baseName, { occurrences: list });
+                }
+            }
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    async saveToCache() {
+        const cachePath = this._cachePathSync();
+        if (!cachePath) return;
+
+        const data = {
+            version: 1,
+            indexPath: this.indexPath,
+            name: this.name,
+            comment: this.comment,
+            example: this.example,
+            directoryList: this.directoryList,
+            directories: Array.from(this.directories.entries()),
+            icons: []
+        };
+
+        for (const [baseName, entry] of this.icons) {
+            const occs = entry.occurrences.map(o => ({
+                dirName: o.dirName,
+                fileName: o.fileName,
+                fullPath: o.fullPath,
+                relPath: o.relPath,
+                size: o.size,
+                context: o.context,
+                type: o.type,
+                isSymlink: o.isSymlink,
+                target: o.target,
+                resolvedTarget: o.resolvedTarget
+            }));
+            data.icons.push([baseName, occs]);
+        }
+
+        try {
+            const text = JSON.stringify(data);
+            const bytes = new TextEncoder().encode(text);
+            const file = Gio.File.new_for_path(cachePath);
+            await file.replace_contents_async(
+                bytes, null, false,
+                Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+        } catch (e) {}
     }
 }
 
@@ -1341,6 +1682,18 @@ class MainApp {
         this.visualRowMap = new Map();
 
         this.buildUI();
+
+        // Восстанавливаем сессию после того, как окно построено.
+        if (this.settings.rememberSession && this.settings.sessionThemes.length) {
+            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                const paths = this.settings.sessionThemes.filter(
+                    p => Gio.File.new_for_path(p).query_exists(null));
+                if (paths.length > 0) {
+                    this.loadThemesWithProgress(paths);
+                }
+                return false;
+            });
+        }
     }
 
     buildUI() {
@@ -1815,14 +2168,68 @@ class MainApp {
                     margin_end: 2
                 });
                 box.pack_start(lbl, false, false, 0);
-                let xBtn = new Gtk.Button({ label: '×' });
+
+                // Кнопка-меню (☰) с действиями над темой.
+                let menuBtn = new Gtk.MenuButton();
+                menuBtn.set_relief(Gtk.ReliefStyle.NONE);
+                menuBtn.set_tooltip_text('Theme actions');
+                try {
+                    menuBtn.set_image(Gtk.Image.new_from_icon_name(
+                        'open-menu-symbolic', Gtk.IconSize.BUTTON));
+                } catch (e) {
+                    menuBtn.set_label('\u2630'); // ☰
+                }
+
+                let menu = new Gtk.Menu();
+
+                let itDir = new Gtk.MenuItem({ label: 'Open theme dir' });
+                itDir.set_tooltip_text('Open the theme folder in the file manager');
+                itDir.connect('activate', () => openPathWithDefault(t.dir));
+                menu.append(itDir);
+
+                let itFile = new Gtk.MenuItem({ label: 'Open index.theme' });
+                itFile.set_tooltip_text('Open index.theme in the default text editor');
+                itFile.connect('activate', () => openPathWithDefault(t.indexPath));
+                menu.append(itFile);
+
+                let itReload = new Gtk.MenuItem({ label: 'Reload theme' });
+                itReload.set_tooltip_text('Re-read the theme from disk, ignoring the cache');
+                itReload.connect('activate', () => this.reloadTheme(t));
+                menu.append(itReload);
+
+                menu.append(new Gtk.SeparatorMenuItem());
+
+                let itEditor = new Gtk.MenuItem({ label: 'Open in Theme Editor' });
+                itEditor.set_tooltip_text(
+                    this.settings.editorCommand
+                        ? ('Run: ' + this.settings.editorCommand)
+                        : 'Set the editor command in Settings');
+                itEditor.set_sensitive(!!this.settings.editorCommand);
+                itEditor.connect('activate', () => this.openInThemeEditor(t));
+                menu.append(itEditor);
+
+                menu.show_all();
+                menuBtn.set_popup(menu);
+                box.pack_start(menuBtn, false, false, 0);
+
+                let xBtn = new Gtk.Button();
                 xBtn.set_relief(Gtk.ReliefStyle.NONE);
                 xBtn.set_tooltip_text('Remove this theme');
+                // Иконка вместо текста — тогда кнопка смотрится так же
+                // крупно, как соседняя с ☰. Если символической иконки
+                // в теме нет, fallback на текстовый крестик.
+                try {
+                    xBtn.set_image(Gtk.Image.new_from_icon_name(
+                        'window-close-symbolic', Gtk.IconSize.BUTTON));
+                } catch (e) {
+                    xBtn.set_label('\u00D7');
+                }
                 xBtn.connect('clicked', () => {
                     this.themes = this.themes.filter(function(x) { return x !== t; });
                     this.rebuildIndex();
                     this.updateThemesBar();
                     this.populateMasterStore();
+                    this.updateSession();
                     this.updateStatus();
                 });
                 box.pack_start(xBtn, false, false, 0);
@@ -1927,6 +2334,7 @@ class MainApp {
         }
 
         let theme = new IconTheme(path);
+        theme.cacheDir = this.settings.cacheDir;
         const ok = await theme.load(progress);
 
         if (progress && progress.isCancelled()) {
@@ -1942,6 +2350,7 @@ class MainApp {
         this.rebuildIndex();
         this.updateThemesBar();
         this.populateMasterStore();
+        this.updateSession();
         return true;
     }
 
@@ -2026,10 +2435,50 @@ class MainApp {
         this.updateStatus();
     }
 
+    async reloadTheme(theme) {
+        theme.icons.clear();
+        theme.directories.clear();
+        theme.directoryList = [];
+        theme._loaded = false;
+        theme.cacheDir = this.settings.cacheDir;
+
+        const progress = new ProgressDialog(this.window,
+            'Reloading theme', 'Reloading ' + theme.name + '...');
+        try {
+            await theme.load(progress, /*forceReload=*/true);
+            this.rebuildIndex();
+            this.updateThemesBar();
+            this.populateMasterStore();
+            this.updateSession();
+        } finally {
+            progress.close();
+        }
+    }
+
+    openInThemeEditor(theme) {
+        const ok = launchEditorCommand(
+            this.settings.editorCommand, theme.dir, theme.indexPath);
+        if (!ok) {
+            this.showError('Failed to launch editor:\n' +
+                this.settings.editorCommand);
+        }
+    }
+
+    updateSession() {
+        if (!this.settings.rememberSession) return;
+        this.settings.sessionThemes = this.themes.map(t => t.indexPath);
+        this.settings.save();
+    }
+
     onSettings() {
         const dlg = new SettingsDialog(this.window, this.settings, () => {
-            // Настройки изменились — обновляем цвета в списке значков.
+            // Настройки изменились: перекрашиваем список,
+            // обновляем сессию и переносим cacheDir на уже загруженные темы.
             this.populateMasterStore();
+            this.updateSession();
+            for (const t of this.themes) {
+                t.cacheDir = this.settings.cacheDir;
+            }
         });
         dlg.run();
     }
