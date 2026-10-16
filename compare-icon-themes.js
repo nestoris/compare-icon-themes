@@ -1315,6 +1315,12 @@ class MainApp {
         this.viewMode = 'All';
         this.settings = new Settings();
 
+        // Управление фоновой обработкой фильтра.
+        this.filterGeneration = 0;
+        this.filterProgress = null;
+        this.filterIdleId = null;
+        this.deferFilter = false;
+
         // Состояние визуальной вкладки в правой панели.
         this.visualPreviewSize = 48;
         this.visualThemeCount = -1;
@@ -1693,7 +1699,7 @@ class MainApp {
         );
         this.viewModeCombo.connect('changed', () => {
             this.viewMode = this.viewModeCombo.get_active_text() || 'All';
-            this.applyFilter();
+            this.applyFilter(true);
         });
         this.statusBox.pack_start(this.viewModeCombo, false, false, 0);
 
@@ -1754,7 +1760,7 @@ class MainApp {
                     this.themes = this.themes.filter(function(x) { return x !== t; });
                     this.rebuildIndex();
                     this.updateThemesBar();
-                    this.applyFilter();
+                    this.applyFilter(false);
                     this.updateStatus();
                 });
                 box.pack_start(xBtn, false, false, 0);
@@ -1805,6 +1811,9 @@ class MainApp {
 
         const progress = new ProgressDialog(this.window, title, text);
 
+        // Пока идёт загрузка, не запускаем фильтр на каждый добавленный
+        // шаг — сделаем один раз в конце, после закрытия прогресса загрузки.
+        this.deferFilter = true;
         try {
             for (let i = 0; i < n; i++) {
                 if (progress.isCancelled()) break;
@@ -1818,8 +1827,13 @@ class MainApp {
         } catch (e) {
             // уже показали ошибку или отменено — просто закрываем
         } finally {
+            this.deferFilter = false;
             progress.close();
         }
+
+        // Один итоговый проход фильтра. Для тяжёлых наборов он сам
+        // покажет диалог прогресса — уже с кнопкой Cancel.
+        this.applyFilter(true);
     }
 
     async addThemeByPath(path, progress) {
@@ -1867,7 +1881,9 @@ class MainApp {
         this.themes.push(theme);
         this.rebuildIndex();
         this.updateThemesBar();
-        this.applyFilter();
+        if (!this.deferFilter) {
+            this.applyFilter();
+        }
         this.updateStatus();
         return true;
     }
@@ -1932,7 +1948,7 @@ class MainApp {
                 this.themes = this.themes.filter(function(t) { return t.indexPath !== idxPath; });
                 this.rebuildIndex();
                 this.updateThemesBar();
-                this.applyFilter();
+                this.applyFilter(false);
                 this.updateStatus();
             }
         }
@@ -1996,26 +2012,193 @@ class MainApp {
         }
         this.filterTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
             this.filterTimer = null;
-            this.applyFilter();
+            // Во время набора текста диалог прогресса мешает печатать,
+            // поэтому запускаем синхронный проход.
+            this.applyFilter(false);
             return false;
         });
     }
 
-    applyFilter() {
-        let text = this.filterEntry.get_text().toLowerCase();
-        const mode = this.viewMode || 'All';
+    applyFilter(showProgress) {
+        // Отменяем предыдущую незавершённую операцию, если была.
+        this.cancelFilterOperation();
 
+        const text = this.filterEntry.get_text().toLowerCase();
+        const mode = this.viewMode || 'All';
+        const gen = ++this.filterGeneration;
+
+        // Прогресс не нужен, если:
+        //   — значков мало,
+        //   — идёт пакетная загрузка тем,
+        //   — пользователь не просил показывать прогресс
+        //     (например, набирает текст в фильтре — там диалог мешает).
+        const total = this.iconIndex.size;
+        if (total < 5000 || this.deferFilter || !showProgress) {
+            this.applyFilterSync(text, mode);
+            return;
+        }
+
+        // Крупный набор — показываем прогресс и обрабатываем порциями.
+        this.filterProgress = new ProgressDialog(this.window,
+            'Applying filter', 'Matching: 0 / ' + total);
+        const progress = this.filterProgress;
+
+        const entries = Array.from(this.iconIndex.entries());
+        this.filteredNames = [];
+        const self = this;
+        const CHUNK = 1000;
+        let i = 0;
+
+        const renderStep = () => {
+            if (gen !== self.filterGeneration) return false;
+            if (progress.isCancelled()) {
+                self.cleanupFilterOperation();
+                return false;
+            }
+
+            const names = self.filteredNames;
+            const totalThemes = self.themes.length;
+            const end = Math.min(i + CHUNK, names.length);
+            for (; i < end; i++) {
+                const name = names[i];
+                const entry = self.iconIndex.get(name);
+                if (!entry) continue;
+                const iter = self.listStore.append();
+
+                const coverage = entry.themes.size + '/' + totalThemes;
+                let contextsStr;
+                if (entry.contexts.size > 1) contextsStr = 'Multiple';
+                else if (entry.contexts.size === 1) {
+                    contextsStr = entry.contexts.values().next().value;
+                } else contextsStr = '';
+
+                let symlinkCount = 0;
+                for (let oi = 0; oi < entry.occurrences.length; oi++) {
+                    if (entry.occurrences[oi].isSymlink) symlinkCount++;
+                }
+
+                let status, color;
+                if (entry.themes.size < totalThemes) {
+                    color = self.settings.colors.missing;
+                    status = 'Missing in ' + (totalThemes - entry.themes.size);
+                } else if (symlinkCount === entry.occurrences.length) {
+                    color = self.settings.colors.symlinksOnly;
+                    status = 'Symlinks only';
+                } else if (symlinkCount > 0) {
+                    color = self.settings.colors.hasSymlinks;
+                    status = 'Has symlinks';
+                } else {
+                    color = self.settings.colors.ok;
+                    status = 'OK';
+                }
+
+                self.listStore.set(iter, [0, 1, 2, 3, 4, 5],
+                    [name, color, coverage, contextsStr, status, name]);
+            }
+
+            progress.setStatus(0.5 + (names.length ? i / names.length * 0.5 : 0.5),
+                'Rendering: ' + i + ' / ' + names.length);
+
+            // setStatus прокачивает события — пользователь мог успеть
+            // переключить фильтр. Проверяем поколение.
+            if (gen !== self.filterGeneration) return false;
+            if (progress.isCancelled()) {
+                self.cleanupFilterOperation();
+                return false;
+            }
+
+            if (i < names.length) {
+                self.filterIdleId = GLib.idle_add(
+                    GLib.PRIORITY_DEFAULT_IDLE, () => {
+                        self.filterIdleId = null;
+                        renderStep();
+                        return false;
+                    });
+                return false;
+            }
+
+            self.cleanupFilterOperation();
+            return false;
+        };
+
+        const filterStep = () => {
+            if (gen !== self.filterGeneration) return false;
+            if (progress.isCancelled()) {
+                self.cleanupFilterOperation();
+                return false;
+            }
+
+            const end = Math.min(i + CHUNK, entries.length);
+            for (; i < end; i++) {
+                const name = entries[i][0];
+                const entry = entries[i][1];
+                if (mode !== 'All' && !self.matchesViewMode(entry, mode)) continue;
+                if (text !== '' && name.toLowerCase().indexOf(text) < 0) continue;
+                self.filteredNames.push(name);
+            }
+
+            progress.setStatus(entries.length ? i / entries.length * 0.5 : 0.5,
+                'Matching: ' + i + ' / ' + entries.length);
+
+            if (gen !== self.filterGeneration) return false;
+            if (progress.isCancelled()) {
+                self.cleanupFilterOperation();
+                return false;
+            }
+
+            if (i < entries.length) {
+                self.filterIdleId = GLib.idle_add(
+                    GLib.PRIORITY_DEFAULT_IDLE, () => {
+                        self.filterIdleId = null;
+                        filterStep();
+                        return false;
+                    });
+                return false;
+            }
+
+            // Сортировка и подготовка к отрисовке.
+            self.filteredNames.sort();
+            i = 0;
+            self.listStore.clear();
+            progress.setStatus(0.5,
+                'Rendering: 0 / ' + self.filteredNames.length);
+            renderStep();
+            return false;
+        };
+
+        this.filterIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this.filterIdleId = null;
+            filterStep();
+            return false;
+        });
+    }
+
+    applyFilterSync(text, mode) {
         this.filteredNames = [];
         for (let [name, entry] of this.iconIndex) {
-            // 1. Первичный фильтр по типу записей.
             if (mode !== 'All' && !this.matchesViewMode(entry, mode)) continue;
-            // 2. Текстовый фильтр по имени.
             if (text !== '' && name.toLowerCase().indexOf(text) < 0) continue;
             this.filteredNames.push(name);
         }
         this.filteredNames.sort();
-
         this.updateListDisplay();
+    }
+
+    cleanupFilterOperation() {
+        if (this.filterIdleId) {
+            GLib.source_remove(this.filterIdleId);
+            this.filterIdleId = null;
+        }
+        if (this.filterProgress) {
+            this.filterProgress.close();
+            this.filterProgress = null;
+        }
+    }
+
+    cancelFilterOperation() {
+        // Счётчик поколений гарантирует, что старые чанки завершатся
+        // тихо, а мы тем самым освобождаем окно прогресса и idle.
+        this.cleanupFilterOperation();
     }
 
     // Классифицирует записи значка по темам:
@@ -2025,6 +2208,7 @@ class MainApp {
     //   - allSymlinkOnly  — во всех темах, где значок есть, он только симлинками;
     //   - hasFileOverall / hasSymlinkOverall — есть ли в принципе файлы/симлинки.
     classifyEntry(entry) {
+        if (entry._cls) return entry._cls;
         const perTheme = new Map();
         let hasFileOverall = false;
         let hasSymlinkOverall = false;
@@ -2063,7 +2247,7 @@ class MainApp {
             }
         }
 
-        return {
+        const result = {
             hasFileOverall: hasFileOverall,
             hasSymlinkOverall: hasSymlinkOverall,
             anyFileOnly: anyFileOnly,
@@ -2071,6 +2255,8 @@ class MainApp {
             allFileOnly: allFileOnly,
             allSymlinkOnly: allSymlinkOnly
         };
+        entry._cls = result;
+        return result;
     }
 
     matchesViewMode(entry, mode) {
