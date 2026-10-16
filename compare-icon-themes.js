@@ -1315,11 +1315,23 @@ class MainApp {
         this.viewMode = 'All';
         this.settings = new Settings();
 
-        // Управление фоновой обработкой фильтра.
-        this.filterGeneration = 0;
-        this.filterProgress = null;
-        this.filterIdleId = null;
-        this.deferFilter = false;
+        // Кэш текущего состояния фильтра для visible_func
+        // (читаем его на каждой строке — из виджетов читать дорого).
+        this.currentFilterText = '';
+        this.currentModeBit = 0;
+
+        // Ссылка на функцию, чтобы GC её не съел.
+        this._visibleFunc = null;
+
+        // Битовая маска режима — см. VIEW_MODE_BITS.
+        this.viewModeBits = {
+            'All': 0,
+            'Originals': 1,
+            'Originals (strict)': 2,
+            'Mixed': 4,
+            'Mixed (strict)': 8,
+            'Symlinks only': 16
+        };
 
         // Состояние визуальной вкладки в правой панели.
         this.visualPreviewSize = 48;
@@ -1419,18 +1431,59 @@ class MainApp {
             width_request: 450
         });
 
-        this.listStore = new Gtk.ListStore();
-        this.listStore.set_column_types([
-            GObject.TYPE_STRING,
-            GObject.TYPE_STRING,
-            GObject.TYPE_STRING,
-            GObject.TYPE_STRING,
-            GObject.TYPE_STRING,
-            GObject.TYPE_STRING
+        // Полная модель со всеми значками. Пересобирается только при
+        // изменении набора тем, не при вводе текста в фильтр.
+        this.masterStore = new Gtk.ListStore();
+        this.masterStore.set_column_types([
+            GObject.TYPE_STRING, // 0 name
+            GObject.TYPE_STRING, // 1 color
+            GObject.TYPE_STRING, // 2 coverage
+            GObject.TYPE_STRING, // 3 contexts
+            GObject.TYPE_STRING, // 4 status
+            GObject.TYPE_STRING, // 5 baseName (для лукапа)
+            GObject.TYPE_INT     // 6 bitmask режимов
         ]);
 
+        // Модель-фильтр. Дочернюю модель передаём через конструктор
+        // с объектом свойств — только так GJS создаёт настоящий
+        // Gtk.TreeModelFilter, а не интерфейсную обёртку Gtk.TreeModel
+        // (у неё нет ни set_child_model, ни set_visible_func).
+        this.filterModel = new Gtk.TreeModelFilter({
+            child_model: this.masterStore
+        });
+
+        this._visibleFunc = (model, iter) => {
+            const name = model.get_value(iter, 0);
+            if (this.currentFilterText &&
+                name.toLowerCase().indexOf(this.currentFilterText) < 0) {
+                return false;
+            }
+            if (this.currentModeBit !== 0) {
+                const flags = model.get_value(iter, 6);
+                if (!(flags & this.currentModeBit)) return false;
+            }
+            return true;
+        };
+
+        if (typeof this.filterModel.set_visible_func !== 'function') {
+            logError(new Error(
+                'Gtk.TreeModelFilter binding problem: ' +
+                'got ' + (this.filterModel.constructor && this.filterModel.constructor.name)
+            ));
+        } else {
+            this.filterModel.set_visible_func(this._visibleFunc);
+        }
+
+        // Сортировщик поверх фильтра — TreeView требует TreeSortable,
+        // а Gtk.TreeModelFilter им не является. Порядок по умолчанию —
+        // по колонке 0 (имя), возрастание.
+        this.sortModel = new Gtk.TreeModelSort({
+            model: this.filterModel
+        });
+        this.sortModel.set_sort_column_id(0, Gtk.SortType.ASCENDING);
+
         this.treeView = new Gtk.TreeView({
-            model: this.listStore,
+            model: this.sortModel,
             headers_clickable: true
         });
 
@@ -1699,7 +1752,7 @@ class MainApp {
         );
         this.viewModeCombo.connect('changed', () => {
             this.viewMode = this.viewModeCombo.get_active_text() || 'All';
-            this.applyFilter(true);
+            this.refilterList();
         });
         this.statusBox.pack_start(this.viewModeCombo, false, false, 0);
 
@@ -1724,8 +1777,17 @@ class MainApp {
     }
 
     updateStatus() {
-        this.setStatus(this.themes.length + ' theme(s) loaded, ' +
-                       this.iconIndex.size + ' unique icon name(s)');
+        const total = this.iconIndex.size;
+        let visible = total;
+        try {
+            if (this.filterModel) {
+                visible = this.filterModel.iter_n_children(null);
+            }
+        } catch (e) {}
+        let s = this.themes.length + ' theme(s) loaded, ' +
+                total + ' unique icon name(s)';
+        if (visible !== total) s += ', ' + visible + ' shown';
+        this.setStatus(s);
     }
 
     updateThemesBar() {
@@ -1760,7 +1822,7 @@ class MainApp {
                     this.themes = this.themes.filter(function(x) { return x !== t; });
                     this.rebuildIndex();
                     this.updateThemesBar();
-                    this.applyFilter(false);
+                    this.populateMasterStore();
                     this.updateStatus();
                 });
                 box.pack_start(xBtn, false, false, 0);
@@ -1813,7 +1875,6 @@ class MainApp {
 
         // Пока идёт загрузка, не запускаем фильтр на каждый добавленный
         // шаг — сделаем один раз в конце, после закрытия прогресса загрузки.
-        this.deferFilter = true;
         try {
             for (let i = 0; i < n; i++) {
                 if (progress.isCancelled()) break;
@@ -1827,13 +1888,12 @@ class MainApp {
         } catch (e) {
             // уже показали ошибку или отменено — просто закрываем
         } finally {
-            this.deferFilter = false;
             progress.close();
         }
 
         // Один итоговый проход фильтра. Для тяжёлых наборов он сам
         // покажет диалог прогресса — уже с кнопкой Cancel.
-        this.applyFilter(true);
+        this.populateMasterStore();
     }
 
     async addThemeByPath(path, progress) {
@@ -1881,10 +1941,7 @@ class MainApp {
         this.themes.push(theme);
         this.rebuildIndex();
         this.updateThemesBar();
-        if (!this.deferFilter) {
-            this.applyFilter();
-        }
-        this.updateStatus();
+        this.populateMasterStore();
         return true;
     }
 
@@ -1948,7 +2005,7 @@ class MainApp {
                 this.themes = this.themes.filter(function(t) { return t.indexPath !== idxPath; });
                 this.rebuildIndex();
                 this.updateThemesBar();
-                this.applyFilter(false);
+                this.populateMasterStore();
                 this.updateStatus();
             }
         }
@@ -1965,14 +2022,14 @@ class MainApp {
             await t.load();
         }
         this.rebuildIndex();
-        this.applyFilter();
+        this.populateMasterStore();
         this.updateStatus();
     }
 
     onSettings() {
         const dlg = new SettingsDialog(this.window, this.settings, () => {
             // Настройки изменились — обновляем цвета в списке значков.
-            this.updateListDisplay();
+            this.populateMasterStore();
         });
         dlg.run();
     }
@@ -2006,199 +2063,86 @@ class MainApp {
     }
 
     onFilterChanged() {
-        if (this.filterTimer) {
-            GLib.source_remove(this.filterTimer);
-            this.filterTimer = null;
-        }
-        this.filterTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
-            this.filterTimer = null;
-            // Во время набора текста диалог прогресса мешает печатать,
-            // поэтому запускаем синхронный проход.
-            this.applyFilter(false);
-            return false;
-        });
+        // refilter() дёшев: просто перебор строк без аллокаций.
+        // Debounce не нужен — вызываем сразу при каждом нажатии.
+        this.refilterList();
     }
 
-    applyFilter(showProgress) {
-        // Отменяем предыдущую незавершённую операцию, если была.
-        this.cancelFilterOperation();
+    // Пересборка полной модели. Вызывается только при изменении
+    // набора тем (добавление, удаление, refresh) и при смене настроек.
+    populateMasterStore() {
+        this.masterStore.clear();
+        const totalThemes = this.themes.length;
 
-        const text = this.filterEntry.get_text().toLowerCase();
-        const mode = this.viewMode || 'All';
-        const gen = ++this.filterGeneration;
+        for (const [name, entry] of this.iconIndex) {
+            const iter = this.masterStore.append();
 
-        // Прогресс не нужен, если:
-        //   — значков мало,
-        //   — идёт пакетная загрузка тем,
-        //   — пользователь не просил показывать прогресс
-        //     (например, набирает текст в фильтре — там диалог мешает).
-        const total = this.iconIndex.size;
-        if (total < 5000 || this.deferFilter || !showProgress) {
-            this.applyFilterSync(text, mode);
-            return;
+            const coverage = entry.themes.size + '/' + totalThemes;
+            let contextsStr;
+            if (entry.contexts.size > 1) contextsStr = 'Multiple';
+            else if (entry.contexts.size === 1) {
+                contextsStr = entry.contexts.values().next().value;
+            } else contextsStr = '';
+
+            let symlinkCount = 0;
+            for (let oi = 0; oi < entry.occurrences.length; oi++) {
+                if (entry.occurrences[oi].isSymlink) symlinkCount++;
+            }
+
+            let status, color;
+            if (entry.themes.size < totalThemes) {
+                color = this.settings.colors.missing;
+                status = 'Missing in ' + (totalThemes - entry.themes.size);
+            } else if (symlinkCount === entry.occurrences.length) {
+                color = this.settings.colors.symlinksOnly;
+                status = 'Symlinks only';
+            } else if (symlinkCount > 0) {
+                color = this.settings.colors.hasSymlinks;
+                status = 'Has symlinks';
+            } else {
+                color = this.settings.colors.ok;
+                status = 'OK';
+            }
+
+            this.masterStore.set(iter, [0, 1, 2, 3, 4, 5, 6], [
+                name, color, coverage, contextsStr, status, name,
+                this.computeModeFlags(entry)
+            ]);
         }
 
-        // Крупный набор — показываем прогресс и обрабатываем порциями.
-        this.filterProgress = new ProgressDialog(this.window,
-            'Applying filter', 'Matching: 0 / ' + total);
-        const progress = this.filterProgress;
-
-        const entries = Array.from(this.iconIndex.entries());
-        this.filteredNames = [];
-        const self = this;
-        const CHUNK = 1000;
-        let i = 0;
-
-        const renderStep = () => {
-            if (gen !== self.filterGeneration) return false;
-            if (progress.isCancelled()) {
-                self.cleanupFilterOperation();
-                return false;
-            }
-
-            const names = self.filteredNames;
-            const totalThemes = self.themes.length;
-            const end = Math.min(i + CHUNK, names.length);
-            for (; i < end; i++) {
-                const name = names[i];
-                const entry = self.iconIndex.get(name);
-                if (!entry) continue;
-                const iter = self.listStore.append();
-
-                const coverage = entry.themes.size + '/' + totalThemes;
-                let contextsStr;
-                if (entry.contexts.size > 1) contextsStr = 'Multiple';
-                else if (entry.contexts.size === 1) {
-                    contextsStr = entry.contexts.values().next().value;
-                } else contextsStr = '';
-
-                let symlinkCount = 0;
-                for (let oi = 0; oi < entry.occurrences.length; oi++) {
-                    if (entry.occurrences[oi].isSymlink) symlinkCount++;
-                }
-
-                let status, color;
-                if (entry.themes.size < totalThemes) {
-                    color = self.settings.colors.missing;
-                    status = 'Missing in ' + (totalThemes - entry.themes.size);
-                } else if (symlinkCount === entry.occurrences.length) {
-                    color = self.settings.colors.symlinksOnly;
-                    status = 'Symlinks only';
-                } else if (symlinkCount > 0) {
-                    color = self.settings.colors.hasSymlinks;
-                    status = 'Has symlinks';
-                } else {
-                    color = self.settings.colors.ok;
-                    status = 'OK';
-                }
-
-                self.listStore.set(iter, [0, 1, 2, 3, 4, 5],
-                    [name, color, coverage, contextsStr, status, name]);
-            }
-
-            progress.setStatus(0.5 + (names.length ? i / names.length * 0.5 : 0.5),
-                'Rendering: ' + i + ' / ' + names.length);
-
-            // setStatus прокачивает события — пользователь мог успеть
-            // переключить фильтр. Проверяем поколение.
-            if (gen !== self.filterGeneration) return false;
-            if (progress.isCancelled()) {
-                self.cleanupFilterOperation();
-                return false;
-            }
-
-            if (i < names.length) {
-                self.filterIdleId = GLib.idle_add(
-                    GLib.PRIORITY_DEFAULT_IDLE, () => {
-                        self.filterIdleId = null;
-                        renderStep();
-                        return false;
-                    });
-                return false;
-            }
-
-            self.cleanupFilterOperation();
-            return false;
-        };
-
-        const filterStep = () => {
-            if (gen !== self.filterGeneration) return false;
-            if (progress.isCancelled()) {
-                self.cleanupFilterOperation();
-                return false;
-            }
-
-            const end = Math.min(i + CHUNK, entries.length);
-            for (; i < end; i++) {
-                const name = entries[i][0];
-                const entry = entries[i][1];
-                if (mode !== 'All' && !self.matchesViewMode(entry, mode)) continue;
-                if (text !== '' && name.toLowerCase().indexOf(text) < 0) continue;
-                self.filteredNames.push(name);
-            }
-
-            progress.setStatus(entries.length ? i / entries.length * 0.5 : 0.5,
-                'Matching: ' + i + ' / ' + entries.length);
-
-            if (gen !== self.filterGeneration) return false;
-            if (progress.isCancelled()) {
-                self.cleanupFilterOperation();
-                return false;
-            }
-
-            if (i < entries.length) {
-                self.filterIdleId = GLib.idle_add(
-                    GLib.PRIORITY_DEFAULT_IDLE, () => {
-                        self.filterIdleId = null;
-                        filterStep();
-                        return false;
-                    });
-                return false;
-            }
-
-            // Сортировка и подготовка к отрисовке.
-            self.filteredNames.sort();
-            i = 0;
-            self.listStore.clear();
-            progress.setStatus(0.5,
-                'Rendering: 0 / ' + self.filteredNames.length);
-            renderStep();
-            return false;
-        };
-
-        this.filterIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            this.filterIdleId = null;
-            filterStep();
-            return false;
-        });
+        this.refilterList();
     }
 
-    applyFilterSync(text, mode) {
-        this.filteredNames = [];
-        for (let [name, entry] of this.iconIndex) {
-            if (mode !== 'All' && !this.matchesViewMode(entry, mode)) continue;
-            if (text !== '' && name.toLowerCase().indexOf(text) < 0) continue;
-            this.filteredNames.push(name);
+    // Мгновенное применение текущего текста фильтра и режима.
+    // Не пересобирает модель — только пересчитывает видимость строк.
+    refilterList() {
+        if (this.filterEntry) {
+            this.currentFilterText =
+                this.filterEntry.get_text().toLowerCase();
         }
-        this.filteredNames.sort();
-        this.updateListDisplay();
+        if (this.viewModeCombo) {
+            const t = this.viewModeCombo.get_active_text() || 'All';
+            this.currentModeBit = this.viewModeBits[t] || 0;
+        }
+        if (this.filterModel) {
+            this.filterModel.refilter();
+        }
+        this.updateStatus();
     }
 
-    cleanupFilterOperation() {
-        if (this.filterIdleId) {
-            GLib.source_remove(this.filterIdleId);
-            this.filterIdleId = null;
-        }
-        if (this.filterProgress) {
-            this.filterProgress.close();
-            this.filterProgress = null;
-        }
-    }
-
-    cancelFilterOperation() {
-        // Счётчик поколений гарантирует, что старые чанки завершатся
-        // тихо, а мы тем самым освобождаем окно прогресса и idle.
-        this.cleanupFilterOperation();
+    // Упаковка классификации значка в один int — чтобы visible_func
+    // на каждой строке читала одно число, а не пересчитывала всё заново.
+    computeModeFlags(entry) {
+        const info = this.classifyEntry(entry);
+        let flags = 0;
+        if (info.anyFileOnly) flags |= 1;
+        if (info.allFileOnly) flags |= 2;
+        if (info.hasFileOverall && info.hasSymlinkOverall &&
+            !info.anyFileOnly) flags |= 4;
+        if (info.hasFileOverall && info.hasSymlinkOverall &&
+            !info.anyFileOnly && !info.anySymlinkOnly) flags |= 8;
+        if (info.allSymlinkOnly) flags |= 16;
+        return flags;
     }
 
     // Классифицирует записи значка по темам:
@@ -2293,47 +2237,6 @@ class MainApp {
             case 'All':
             default:
                 return true;
-        }
-    }
-
-    updateListDisplay() {
-        this.listStore.clear();
-
-        let totalThemes = this.themes.length;
-
-        for (let i = 0; i < this.filteredNames.length; i++) {
-            let name = this.filteredNames[i];
-            let entry = this.iconIndex.get(name);
-            let iter = this.listStore.append();
-
-            let coverage = entry.themes.size + '/' + totalThemes;
-            let contextsStr;
-            if (entry.contexts.size > 1) contextsStr = 'Multiple';
-            else if (entry.contexts.size === 1) contextsStr = entry.contexts.values().next().value;
-            else contextsStr = '';
-
-            let symlinkCount = 0;
-            for (let oi = 0; oi < entry.occurrences.length; oi++) {
-                if (entry.occurrences[oi].isSymlink) symlinkCount++;
-            }
-
-            let status, color;
-            if (entry.themes.size < totalThemes) {
-                color = this.settings.colors.missing;
-                status = 'Missing in ' + (totalThemes - entry.themes.size);
-            } else if (symlinkCount === entry.occurrences.length) {
-                color = this.settings.colors.symlinksOnly;
-                status = 'Symlinks only';
-            } else if (symlinkCount > 0) {
-                color = this.settings.colors.hasSymlinks;
-                status = 'Has symlinks';
-            } else {
-                color = this.settings.colors.ok;
-                status = 'OK';
-            }
-
-            this.listStore.set(iter, [0, 1, 2, 3, 4, 5],
-                [name, color, coverage, contextsStr, status, name]);
         }
     }
 
